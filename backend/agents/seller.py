@@ -71,8 +71,8 @@ async def investigate_carousell_seller(seller_username: str, timeout: float = 15
     result = await tinyfish_extract(
         url=profile_url,
         goal=SELLER_PROFILE_GOAL,
-        stealth=True,
-        proxy_country="US",
+        stealth=False,
+        proxy_country=None,
         timeout=timeout,
     )
     if result is not None:

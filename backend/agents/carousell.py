@@ -49,8 +49,8 @@ async def extract_carousell_listing(url: str, timeout: float = 15.0) -> tuple[di
     result = await tinyfish_extract(
         url=url,
         goal=CAROUSELL_LISTING_GOAL,
-        stealth=True,
-        proxy_country="US",
+        stealth=False,
+        proxy_country=None,
         timeout=timeout,
     )
     if result is not None:

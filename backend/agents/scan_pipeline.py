@@ -5,7 +5,7 @@ import logging
 import time
 from typing import AsyncGenerator
 
-from agents.market_scan import scan_carousell_market, scan_viagogo_market
+from agents.market_scan import scan_carousell_market, scan_viagogo_market, scan_markets_batch
 from classify import classify
 from models.events import ScanStats
 
@@ -38,15 +38,19 @@ async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
 
     yield {"event": "scan_started", "data": {"event_name": event_name, "platforms": ["Carousell", "Viagogo"]}}
 
-    # Phase 1: Discovery -- reuse existing market_scan functions
+    # Phase 1: Discovery -- use async batch API for true parallel execution
     try:
-        carousell_listings, viagogo_listings = await asyncio.gather(
-            scan_carousell_market(event_name, "tickets"),
-            scan_viagogo_market(event_name),
-        )
+        carousell_listings, viagogo_listings = await scan_markets_batch(event_name)
     except Exception as e:
-        logger.warning("Discovery failed: %s, using empty results", e)
-        carousell_listings, viagogo_listings = [], []
+        logger.warning("Batch discovery failed: %s, trying sequential fallback", e)
+        try:
+            carousell_listings, viagogo_listings = await asyncio.gather(
+                scan_carousell_market(event_name, "tickets"),
+                scan_viagogo_market(event_name),
+            )
+        except Exception as e2:
+            logger.warning("Sequential discovery also failed: %s", e2)
+            carousell_listings, viagogo_listings = [], []
 
     carousell_listings = _assign_ids(carousell_listings, "Carousell")
     viagogo_listings = _assign_ids(viagogo_listings, "Viagogo")

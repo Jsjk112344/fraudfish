@@ -6,7 +6,7 @@ import asyncio
 import logging
 from urllib.parse import quote
 
-from agents.base import tinyfish_extract
+from agents.base import tinyfish_extract, tinyfish_extract_batch
 from agents.stats import compute_market_stats
 from mock.data import MOCK_STEPS
 
@@ -32,8 +32,8 @@ async def scan_carousell_market(event_name: str, category: str) -> list[dict]:
     result = await tinyfish_extract(
         url=search_url,
         goal=goal,
-        stealth=True,
-        proxy_country="US",
+        stealth=False,
+        proxy_country=None,
         timeout=45.0,
     )
     return _normalize_listings(result)
@@ -48,8 +48,8 @@ async def scan_viagogo_market(event_name: str) -> list[dict]:
     result = await tinyfish_extract(
         url="https://www.viagogo.com/",
         goal=goal,
-        stealth=True,
-        proxy_country="US",
+        stealth=False,
+        proxy_country=None,
         timeout=45.0,
     )
     return _normalize_listings(result)
@@ -84,6 +84,36 @@ async def check_market_rates(
     }
 
     return stats
+
+
+async def scan_markets_batch(event_name: str, category: str = "tickets") -> tuple[list[dict], list[dict]]:
+    """Search Carousell + Viagogo concurrently via async batch API.
+
+    Fires both requests simultaneously on TinyFish infra, polls for results.
+    Significantly faster than sequential SSE for Cloudflare-heavy sites.
+    """
+    search_url = f"https://www.carousell.sg/search/{quote(event_name)}"
+    carousell_goal = (
+        f"Search for '{event_name}' {category} tickets. "
+        "Extract a JSON array of listings with keys: title, price, seller."
+    )
+    viagogo_goal = (
+        f"Search for '{event_name}' tickets. "
+        "Extract a JSON array of listings with keys: title, price, seller."
+    )
+
+    results = await tinyfish_extract_batch(
+        [
+            {"url": search_url, "goal": carousell_goal},
+            {"url": "https://www.viagogo.com/", "goal": viagogo_goal},
+        ],
+        timeout=120.0,
+        poll_interval=5.0,
+    )
+
+    carousell = _normalize_listings(results[0]) if results[0] else []
+    viagogo = _normalize_listings(results[1]) if results[1] else []
+    return carousell, viagogo
 
 
 async def check_market_with_fallback(listing_data: dict) -> tuple[dict, bool]:

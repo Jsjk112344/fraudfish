@@ -190,8 +190,8 @@ async def discover_sistic_events() -> list[dict]:
     result = await tinyfish_extract(
         url="https://www.sistic.com.sg",
         goal=SISTIC_DISCOVERY_GOAL,
-        stealth=True,
-        proxy_country="US",
+        stealth=False,
+        proxy_country=None,
         timeout=60.0,
     )
     return _normalize_events(result, "SISTIC")
@@ -202,8 +202,8 @@ async def discover_ticketmaster_events() -> list[dict]:
     result = await tinyfish_extract(
         url="https://www.ticketmaster.sg",
         goal=TICKETMASTER_SG_DISCOVERY_GOAL,
-        stealth=True,
-        proxy_country="US",
+        stealth=False,
+        proxy_country=None,
         timeout=60.0,
     )
     return _normalize_events(result, "Ticketmaster SG")
@@ -266,8 +266,8 @@ async def discover_events_with_streaming() -> AsyncGenerator[dict, None]:
             url="https://www.sistic.com.sg",
             goal=SISTIC_DISCOVERY_GOAL,
             step_label="discover_sistic",
-            stealth=True,
-            proxy_country="US",
+            stealth=False,
+            proxy_country=None,
             timeout=60.0,
         ):
             if ev["event"] == "agent_result":
@@ -282,8 +282,8 @@ async def discover_events_with_streaming() -> AsyncGenerator[dict, None]:
             url="https://www.ticketmaster.sg",
             goal=TICKETMASTER_SG_DISCOVERY_GOAL,
             step_label="discover_ticketmaster",
-            stealth=True,
-            proxy_country="US",
+            stealth=False,
+            proxy_country=None,
             timeout=60.0,
         ):
             if ev["event"] == "agent_result":

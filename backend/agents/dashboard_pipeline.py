@@ -5,9 +5,10 @@ import logging
 import time
 from typing import AsyncGenerator
 
-from agents.event_discovery import discover_events, discover_events_with_streaming
+from agents.event_discovery import discover_events, discover_events_with_streaming, SISTIC_DISCOVERY_GOAL, TICKETMASTER_SG_DISCOVERY_GOAL, _normalize_events, SEED_EVENTS
 from agents.risk_scoring import rank_events
 from agents.market_scan import scan_carousell_market, scan_viagogo_market
+from agents.base import tinyfish_extract_batch
 from classify import classify
 from models.events import ScanStats
 
@@ -37,24 +38,56 @@ async def run_dashboard_discovery() -> AsyncGenerator[dict, None]:
     }}
 
     yield {"event": "discovery_progress", "data": {
-        "message": "Launching TinyFish agents to scan SISTIC and Ticketmaster SG...",
+        "message": "Launching TinyFish agents to scan SISTIC and Ticketmaster SG in parallel...",
     }}
 
-    # Use streaming-aware discovery to forward live browser previews
+    # Fire SISTIC + Ticketmaster in true parallel via async batch API
+    # Both agents run simultaneously on TinyFish infra — no sequential blocking
     events: list[dict] = []
     is_live = False
 
-    async for ev in discover_events_with_streaming():
-        if ev["event"] == "discovery_result":
-            events = ev["data"]["events"]
-            is_live = ev["data"]["is_live"]
-        else:
-            # Forward agent_streaming and agent_progress events directly
-            yield ev
+    def _on_batch_progress(task_idx: int, status: str, run_data: dict):
+        """Log polling progress (can't yield from callback, but logs are visible)."""
+        source = "SISTIC" if task_idx == 0 else "Ticketmaster SG"
+        steps = run_data.get("num_of_steps")
+        logger.info("Discovery poll: %s status=%s steps=%s", source, status, steps)
+
+    results = await tinyfish_extract_batch(
+        [
+            {"url": "https://www.sistic.com.sg", "goal": SISTIC_DISCOVERY_GOAL},
+            {"url": "https://www.ticketmaster.sg", "goal": TICKETMASTER_SG_DISCOVERY_GOAL},
+        ],
+        timeout=300.0,
+        poll_interval=5.0,
+        on_progress=_on_batch_progress,
+    )
+
+    sistic_events = _normalize_events(results[0], "SISTIC") if results[0] else []
+    ticketmaster_events = _normalize_events(results[1], "Ticketmaster SG") if results[1] else []
 
     yield {"event": "discovery_progress", "data": {
-        "message": f"Found {len(events)} events, calculating risk scores...",
+        "message": f"SISTIC: {len(sistic_events)} events, Ticketmaster: {len(ticketmaster_events)} events. Ranking by risk...",
     }}
+
+    # Merge and deduplicate
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for ev in sistic_events + ticketmaster_events:
+        name_key = ev.get("event_name", "").strip().lower()
+        if name_key and name_key not in seen:
+            seen.add(name_key)
+            merged.append(ev)
+
+    is_live = len(merged) >= 3
+    if not is_live:
+        logger.info("Only %d live events found, supplementing with seed data", len(merged))
+        for ev in SEED_EVENTS:
+            name_key = ev["event_name"].strip().lower()
+            if name_key not in seen:
+                seen.add(name_key)
+                merged.append(ev)
+
+    events = merged
 
     ranked = rank_events(events)
 

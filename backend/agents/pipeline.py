@@ -12,8 +12,8 @@ from agents.official_price import verify_event_official
 from models.events import InvestigationEvent
 from models.enums import StepStatus
 
-TOTAL_TIMEOUT = 60.0  # seconds for entire investigation
-STEP_TIMEOUT = 15.0   # seconds per TinyFish step
+TOTAL_TIMEOUT = 600.0  # 10 minutes — agents take time on Cloudflare sites
+STEP_TIMEOUT = 300.0   # 5 minutes per step — no artificial cutoff
 
 
 async def run_live_investigation(url: str) -> AsyncGenerator[InvestigationEvent, None]:
