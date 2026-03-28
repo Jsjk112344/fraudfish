@@ -32,6 +32,7 @@ class VerdictResult(BaseModel):
 
 class ScanRequest(BaseModel):
     event_name: str
+    city: str = "Singapore"
 
 
 class ScanListingResult(BaseModel):

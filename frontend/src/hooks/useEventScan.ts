@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback } from 'react';
 import type { ScanListing, ScanStats, ScanState } from '../types/scan';
 import type { VerdictResult } from '../types/investigation';
+import type { AgentStream } from '../types/dashboard';
 import { startEventScan } from '../api/scan';
 
 const EMPTY_STATS: ScanStats = {
@@ -20,6 +21,7 @@ export function useEventScan() {
   const [error, setError] = useState<string | null>(null);
   const [progressMessage, setProgressMessage] = useState<string | null>(null);
   const [progressLog, setProgressLog] = useState<Array<{ phase: string; message: string }>>([]);
+  const [activeStreams, setActiveStreams] = useState<AgentStream[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const handleEvent = useCallback((event: { event: string; data: Record<string, unknown> }) => {
@@ -36,7 +38,21 @@ export function useEventScan() {
         break;
       }
 
+      case 'agent_streaming': {
+        const stream: AgentStream = {
+          step: event.data.step as string,
+          streaming_url: event.data.streaming_url as string,
+        };
+        setActiveStreams((prev) => {
+          if (prev.some((s) => s.streaming_url === stream.streaming_url)) return prev;
+          return [...prev, stream];
+        });
+        break;
+      }
+
       case 'listings_found': {
+        // Discovery is done — clear live browser previews
+        setActiveStreams([]);
         const foundListings = (event.data.listings as Array<Record<string, unknown>>) || [];
         setListings(
           foundListings.map((l) => ({
@@ -95,13 +111,14 @@ export function useEventScan() {
     }
   }, []);
 
-  const start = useCallback((eventName: string) => {
+  const start = useCallback((eventName: string, city: string = 'Singapore') => {
     // Reset state
     setListings([]);
     setStats(EMPTY_STATS);
     setError(null);
     setProgressMessage(null);
     setProgressLog([]);
+    setActiveStreams([]);
     setState('scanning');
 
     const controller = new AbortController();
@@ -109,6 +126,7 @@ export function useEventScan() {
 
     startEventScan(
       eventName,
+      city,
       handleEvent,
       (err) => {
         if (!controller.signal.aborted) {
@@ -132,8 +150,9 @@ export function useEventScan() {
     setError(null);
     setProgressMessage(null);
     setProgressLog([]);
+    setActiveStreams([]);
     setState('idle');
   }, []);
 
-  return { state, listings, stats, error, progressMessage, progressLog, start, cancel };
+  return { state, listings, stats, error, progressMessage, progressLog, activeStreams, start, cancel };
 }

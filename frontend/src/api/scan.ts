@@ -2,6 +2,7 @@ import { fetchEventSource } from '@microsoft/fetch-event-source';
 
 export async function startEventScan(
   eventName: string,
+  city: string,
   onEvent: (event: { event: string; data: Record<string, unknown> }) => void,
   onError: (error: Error) => void,
   signal: AbortSignal
@@ -9,7 +10,7 @@ export async function startEventScan(
   await fetchEventSource('/api/scan', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ event_name: eventName }),
+    body: JSON.stringify({ event_name: eventName, city }),
     signal,
     openWhenHidden: true,
     onmessage(ev) {

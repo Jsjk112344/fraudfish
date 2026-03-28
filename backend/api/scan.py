@@ -13,7 +13,7 @@ router = APIRouter()
 
 @router.post("/api/scan")
 async def scan_event(request: Request, body: ScanRequest):
-    pipeline = run_event_scan(body.event_name)
+    pipeline = run_event_scan(body.event_name, city=body.city)
 
     async def event_generator():
         try:

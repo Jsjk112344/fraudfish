@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect } from 'react';
 import type { ScanListing, ScanStats } from '../types/scan';
+import type { AgentStream } from '../types/dashboard';
 import { ThreatSummary } from './ThreatSummary';
 import { ScanListingRow } from './ScanListingRow';
+import { LivePreview } from './LivePreview';
 
 interface ScanResultsProps {
   listings: ScanListing[];
@@ -9,6 +11,7 @@ interface ScanResultsProps {
   isScanning: boolean;
   progressMessage?: string | null;
   progressLog?: Array<{ phase: string; message: string }>;
+  activeStreams?: AgentStream[];
 }
 
 const PHASE_ICONS: Record<string, string> = {
@@ -17,7 +20,7 @@ const PHASE_ICONS: Record<string, string> = {
   general: 'info',
 };
 
-export function ScanResults({ listings, stats, isScanning, progressMessage, progressLog }: ScanResultsProps) {
+export function ScanResults({ listings, stats, isScanning, progressMessage, progressLog, activeStreams }: ScanResultsProps) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const logEndRef = useRef<HTMLDivElement>(null);
 
@@ -44,54 +47,64 @@ export function ScanResults({ listings, stats, isScanning, progressMessage, prog
     <div>
       {/* Agent Activity Panel — shown while scanning */}
       {isScanning && (
-        <div className="glass border border-outline-variant/20 rounded-xl overflow-hidden mb-6">
-          {/* Header */}
-          <div className="flex items-center gap-2 px-4 py-2.5 border-b border-outline-variant/10 bg-surface-container/50">
-            <span className="relative flex h-2 w-2">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-500 opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500" />
-            </span>
-            <span className="text-[10px] uppercase tracking-widest font-headline font-bold text-red-400">
-              AGENT ACTIVE
-            </span>
-            <span className="text-xs text-on-surface-variant font-body">
-              {progressMessage || 'Initializing scan...'}
-            </span>
-          </div>
-
-          {/* Activity Log */}
-          {progressLog && progressLog.length > 0 && (
-            <div className="px-4 py-3 max-h-40 overflow-y-auto bg-surface-container-lowest/50">
-              <div className="flex flex-col gap-1.5">
-                {progressLog.map((entry, i) => (
-                  <div
-                    key={i}
-                    className={`flex items-start gap-2 text-xs font-mono ${
-                      i === progressLog.length - 1 ? 'text-primary' : 'text-on-surface-variant/50'
-                    }`}
-                  >
-                    <span className="material-symbols-outlined text-sm flex-shrink-0 mt-px">
-                      {PHASE_ICONS[entry.phase] || 'info'}
-                    </span>
-                    <span className="truncate">{entry.message}</span>
-                  </div>
-                ))}
-                <div ref={logEndRef} />
-              </div>
-            </div>
-          )}
-
-          {/* Scanning without log entries yet — loading state */}
-          {(!progressLog || progressLog.length === 0) && (
-            <div className="flex items-center justify-center py-8">
-              <div className="flex flex-col items-center gap-3">
-                <span className="material-symbols-outlined text-4xl text-primary/40 animate-pulse">
-                  satellite_alt
+        <div className="flex flex-col gap-6 mb-6">
+          {/* Live browser preview(s) from TinyFish agents */}
+          {activeStreams && activeStreams.length > 0 ? (
+            <LivePreview
+              streams={activeStreams}
+              narration={(progressLog || []).map((e) => ({ step: e.phase, message: e.message }))}
+              label={progressMessage || undefined}
+            />
+          ) : (
+            /* Activity panel when no streams yet */
+            <div className="glass border border-outline-variant/20 rounded-xl overflow-hidden">
+              {/* Header */}
+              <div className="flex items-center gap-2 px-4 py-2.5 border-b border-outline-variant/10 bg-surface-container/50">
+                <span className="relative flex h-2 w-2">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-500 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500" />
                 </span>
-                <p className="text-sm font-body text-on-surface-variant">
-                  Launching TinyFish agents...
-                </p>
+                <span className="text-[10px] uppercase tracking-widest font-headline font-bold text-red-400">
+                  AGENT ACTIVE
+                </span>
+                <span className="text-xs text-on-surface-variant font-body">
+                  {progressMessage || 'Initializing scan...'}
+                </span>
               </div>
+
+              {/* Activity Log */}
+              {progressLog && progressLog.length > 0 ? (
+                <div className="px-4 py-3 max-h-40 overflow-y-auto bg-surface-container-lowest/50">
+                  <div className="flex flex-col gap-1.5">
+                    {progressLog.map((entry, i) => (
+                      <div
+                        key={i}
+                        className={`flex items-start gap-2 text-xs font-mono ${
+                          i === progressLog.length - 1 ? 'text-primary' : 'text-on-surface-variant/50'
+                        }`}
+                      >
+                        <span className="material-symbols-outlined text-sm flex-shrink-0 mt-px">
+                          {PHASE_ICONS[entry.phase] || 'info'}
+                        </span>
+                        <span className="truncate">{entry.message}</span>
+                      </div>
+                    ))}
+                    <div ref={logEndRef} />
+                  </div>
+                </div>
+              ) : (
+                /* Scanning without log entries yet — loading state */
+                <div className="flex items-center justify-center py-8">
+                  <div className="flex flex-col items-center gap-3">
+                    <span className="material-symbols-outlined text-4xl text-primary/40 animate-pulse">
+                      satellite_alt
+                    </span>
+                    <p className="text-sm font-body text-on-surface-variant">
+                      Launching TinyFish agents...
+                    </p>
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>

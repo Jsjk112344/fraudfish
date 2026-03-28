@@ -4,13 +4,23 @@ type InputMode = 'investigate' | 'scan' | 'dashboard';
 
 interface InputSectionProps {
   onSubmit: (url: string) => void;
-  onScan?: (eventName: string) => void;
+  onScan?: (eventName: string, city: string) => void;
   onDashboard?: () => void;
   isRunning: boolean;
   onCancel: () => void;
   activeMode?: InputMode;
   onModeChange?: (mode: InputMode) => void;
 }
+
+const CITIES = [
+  { value: 'Singapore', label: 'Singapore', flag: '���🇬' },
+  { value: 'Hong Kong', label: 'Hong Kong', flag: '🇭🇰' },
+  { value: 'Kuala Lumpur', label: 'Kuala Lumpur', flag: '🇲��' },
+  { value: 'Jakarta', label: 'Jakarta', flag: '🇮🇩' },
+  { value: 'Manila', label: 'Manila', flag: '🇵🇭' },
+  { value: 'Taipei', label: 'Taipei', flag: '🇹🇼' },
+  { value: 'Bangkok', label: 'Bangkok', flag: '🇹🇭' },
+];
 
 const SAMPLE_URL = 'https://www.carousell.sg/p/f1-singapore-gp-2026-pit-grandstand-1234567890';
 
@@ -40,6 +50,7 @@ export function InputSection({
   onModeChange = () => {},
 }: InputSectionProps) {
   const [input, setInput] = useState('');
+  const [city, setCity] = useState('Singapore');
   const [error, setError] = useState<string | null>(null);
 
   function switchMode(mode: InputMode) {
@@ -67,7 +78,7 @@ export function InputSection({
       return;
     }
     setError(null);
-    onScan(target.trim());
+    onScan(target.trim(), city);
   }
 
   function handleSubmit(value?: string) {
@@ -147,6 +158,19 @@ export function InputSection({
               <span className="material-symbols-outlined text-outline ml-2">
                 {activeMode === 'investigate' ? 'link' : 'search'}
               </span>
+              {activeMode === 'scan' && (
+                <select
+                  value={city}
+                  onChange={(e) => setCity(e.target.value)}
+                  className="bg-surface-container-highest text-on-surface text-xs font-headline font-bold rounded-md px-2 py-1.5 border border-outline-variant/20 outline-none focus:border-primary/50 cursor-pointer flex-shrink-0"
+                >
+                  {CITIES.map((c) => (
+                    <option key={c.value} value={c.value}>
+                      {c.flag} {c.label}
+                    </option>
+                  ))}
+                </select>
+              )}
               <input
                 type="text"
                 value={input}

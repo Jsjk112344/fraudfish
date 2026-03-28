@@ -50,9 +50,21 @@ export function ScanListingRow({ listing, isExpanded, onToggle }: ScanListingRow
             <p className="font-headline font-bold text-sm text-on-surface truncate">
               {listing.title}
             </p>
-            <p className="text-xs text-on-surface-variant font-body">
-              Seller: {listing.seller} | {listing.platform}
-            </p>
+            <div className="flex items-center gap-2 text-xs text-on-surface-variant font-body">
+              <span>Seller: {listing.seller} | {listing.platform}</span>
+              {listing.url && (
+                <a
+                  href={listing.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                  className="inline-flex items-center gap-0.5 text-primary hover:text-primary/80 transition-colors"
+                >
+                  <span className="material-symbols-outlined text-sm">open_in_new</span>
+                  View
+                </a>
+              )}
+            </div>
           </div>
         </div>
 
@@ -114,12 +126,25 @@ export function ScanListingRow({ listing, isExpanded, onToggle }: ScanListingRow
           <p className="text-sm text-on-surface-variant font-body whitespace-pre-wrap">
             {listing.verdict.reasoning}
           </p>
-          <button
-            onClick={onToggle}
-            className="mt-3 text-xs text-on-surface-variant underline cursor-pointer"
-          >
-            Collapse
-          </button>
+          {listing.url && (
+            <a
+              href={listing.url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-3 inline-flex items-center gap-1.5 text-xs text-primary hover:text-primary/80 font-mono transition-colors"
+            >
+              <span className="material-symbols-outlined text-sm">open_in_new</span>
+              {listing.url.length > 60 ? listing.url.slice(0, 60) + '...' : listing.url}
+            </a>
+          )}
+          <div className="mt-2">
+            <button
+              onClick={onToggle}
+              className="text-xs text-on-surface-variant underline cursor-pointer"
+            >
+              Collapse
+            </button>
+          </div>
         </div>
       )}
     </div>

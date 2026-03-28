@@ -77,6 +77,7 @@ export default function App() {
               isScanning={scan.state === 'scanning'}
               progressMessage={scan.progressMessage}
               progressLog={scan.progressLog}
+              activeStreams={scan.activeStreams}
             />
           </div>
         )}

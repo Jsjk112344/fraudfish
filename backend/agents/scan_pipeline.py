@@ -2,10 +2,11 @@
 
 import asyncio
 import logging
+import re
 import time
 from typing import AsyncGenerator
 
-from agents.market_scan import scan_carousell_market, scan_viagogo_market, scan_markets_batch
+from agents.base import tinyfish_extract_with_streaming, tinyfish_extract_batch
 from classify import classify
 from models.events import ScanStats
 
@@ -13,6 +14,20 @@ logger = logging.getLogger(__name__)
 
 MAX_LISTINGS = 12  # Cap total listings for demo timing
 CONCURRENCY = 3    # Max concurrent TinyFish sessions
+
+
+def _parse_price(raw) -> float:
+    """Safely parse a price value that may contain currency symbols like 'S$250'."""
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str):
+        cleaned = re.sub(r'[^\d.]', '', raw)
+        if cleaned:
+            try:
+                return float(cleaned)
+            except ValueError:
+                return 0.0
+    return 0.0
 
 
 def _assign_ids(listings: list[dict], platform: str) -> list[dict]:
@@ -23,11 +38,50 @@ def _assign_ids(listings: list[dict], platform: str) -> list[dict]:
     return listings
 
 
-async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
+CITY_CONFIG: dict[str, dict] = {
+    "Singapore": {
+        "carousell_domain": "www.carousell.sg",
+        "currency": "SGD",
+        "locale": "Singapore",
+    },
+    "Hong Kong": {
+        "carousell_domain": "www.carousell.com.hk",
+        "currency": "HKD",
+        "locale": "Hong Kong",
+    },
+    "Kuala Lumpur": {
+        "carousell_domain": "www.carousell.com.my",
+        "currency": "MYR",
+        "locale": "Malaysia",
+    },
+    "Jakarta": {
+        "carousell_domain": "www.carousell.co.id",
+        "currency": "IDR",
+        "locale": "Indonesia",
+    },
+    "Manila": {
+        "carousell_domain": "www.carousell.ph",
+        "currency": "PHP",
+        "locale": "Philippines",
+    },
+    "Taipei": {
+        "carousell_domain": "www.carousell.com.tw",
+        "currency": "TWD",
+        "locale": "Taiwan",
+    },
+    "Bangkok": {
+        "carousell_domain": "www.carousell.co.th",
+        "currency": "THB",
+        "locale": "Thailand",
+    },
+}
+
+
+async def run_event_scan(event_name: str, city: str = "Singapore") -> AsyncGenerator[dict, None]:
     """Orchestrate batch scan: discover -> investigate -> aggregate.
 
     SSE event types yielded:
-    - scan_started: {event_name, platforms}
+    - scan_started: {event_name, city, platforms}
     - listings_found: {listings, total_count, by_platform}
     - listing_update: {listing_id, status, data}
     - listing_verdict: {listing_id, verdict, listing_summary}
@@ -35,30 +89,117 @@ async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
     - scan_complete: {final_stats, duration_seconds}
     """
     start_time = time.time()
+    cfg = CITY_CONFIG.get(city, CITY_CONFIG["Singapore"])
+    locale = cfg["locale"]
 
-    yield {"event": "scan_started", "data": {"event_name": event_name, "platforms": ["Carousell", "Viagogo"]}}
+    yield {"event": "scan_started", "data": {"event_name": event_name, "city": city, "platforms": ["Carousell", "Viagogo"]}}
 
-    # Phase 1: Discovery -- use async batch API for true parallel execution
+    # Phase 1: Discovery -- batch API with streaming URL capture for live preview
+    from urllib.parse import quote
+
     yield {"event": "scan_progress", "data": {
         "phase": "discovery",
-        "message": f"Launching agents to search Carousell and Viagogo for '{event_name}'...",
+        "message": f"Launching agents to search Carousell ({locale}) and Viagogo for '{event_name}'...",
     }}
+
+    carousell_domain = cfg["carousell_domain"]
+    carousell_search_url = f"https://{carousell_domain}/search/{quote(event_name)}"
+    viagogo_search_url = f"https://www.viagogo.com/search?q={quote(event_name + ' ' + city)}"
+    city_instruction = f"IMPORTANT: Only include events/listings located in or near {city}. Ignore events in other cities or countries. "
+    ticket_filter = (
+        "Only include listings that are selling event tickets "
+        "(concert tickets, sports tickets, show tickets, festival passes). "
+        "Skip merchandise, fan goods, collectibles, clothing, accessories, or unrelated items. "
+    )
+    extraction_goal = (
+        "Extract a JSON array of listings with keys: title, price, seller, url. "
+        "The url should be the full link to each listing page. "
+        "If there is a Cloudflare Turnstile or CAPTCHA challenge, wait for it to resolve, "
+        "then proceed to extract the listings."
+    )
+
+    # Use streaming extraction (like dashboard) for real-time progress + live previews
+    # This keeps the SSE connection alive with continuous agent_progress events
+    discovery_event_queue: asyncio.Queue[dict] = asyncio.Queue()
+
+    carousell_task = asyncio.create_task(
+        tinyfish_extract_with_streaming(
+            url=carousell_search_url,
+            goal=(
+                f"Search for '{event_name}' tickets in {city}. "
+                f"{city_instruction}"
+                f"{ticket_filter}"
+                f"{extraction_goal}"
+            ),
+            stealth=True,
+            proxy_country="AU",
+            timeout=600.0,
+            event_queue=discovery_event_queue,
+            step_label="scan_carousell",
+        )
+    )
+    viagogo_task = asyncio.create_task(
+        tinyfish_extract_with_streaming(
+            url=viagogo_search_url,
+            goal=(
+                f"Search results for '{event_name}' tickets in {city}. "
+                f"{city_instruction}"
+                f"{ticket_filter}"
+                f"{extraction_goal}"
+            ),
+            stealth=True,
+            proxy_country="AU",
+            timeout=600.0,
+            event_queue=discovery_event_queue,
+            step_label="scan_viagogo",
+        )
+    )
+
     try:
-        carousell_listings, viagogo_listings = await scan_markets_batch(event_name)
+        # Drain events from both agents in real-time (streaming URLs + progress)
+        while not (carousell_task.done() and viagogo_task.done()):
+            try:
+                ev = await asyncio.wait_for(discovery_event_queue.get(), timeout=2.0)
+                yield ev
+                # Also forward as scan_progress so the narration log updates
+                if ev["event"] == "agent_progress":
+                    yield {"event": "scan_progress", "data": {
+                        "phase": "discovery",
+                        "message": ev["data"].get("message", ""),
+                    }}
+            except asyncio.TimeoutError:
+                pass
+
+        # Drain remaining queued events
+        while not discovery_event_queue.empty():
+            ev = discovery_event_queue.get_nowait()
+            yield ev
+
+        carousell_result = await carousell_task
+        viagogo_result = await viagogo_task
+
+        def _normalize(result) -> list[dict]:
+            if isinstance(result, list):
+                return result
+            if isinstance(result, dict):
+                return result.get("listings") or result.get("results") or []
+            return []
+
+        carousell_listings = _normalize(carousell_result.data) if carousell_result.data else []
+        viagogo_listings = _normalize(viagogo_result.data) if viagogo_result.data else []
+
     except Exception as e:
-        logger.warning("Batch discovery failed: %s, trying sequential fallback", e)
+        logger.warning("Discovery failed: %s", e)
         yield {"event": "scan_progress", "data": {
             "phase": "discovery",
-            "message": "Batch search failed, retrying with sequential agents...",
+            "message": "Discovery failed, using fallback...",
         }}
-        try:
-            carousell_listings, viagogo_listings = await asyncio.gather(
-                scan_carousell_market(event_name, "tickets"),
-                scan_viagogo_market(event_name),
-            )
-        except Exception as e2:
-            logger.warning("Sequential discovery also failed: %s", e2)
-            carousell_listings, viagogo_listings = [], []
+        carousell_listings, viagogo_listings = [], []
+        # Cancel any still-running tasks
+        for t in (carousell_task, viagogo_task):
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(carousell_task, viagogo_task, return_exceptions=True)
 
     carousell_listings = _assign_ids(carousell_listings, "Carousell")
     viagogo_listings = _assign_ids(viagogo_listings, "Viagogo")
@@ -77,7 +218,7 @@ async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
                     "listing_id": l["listing_id"],
                     "platform": l["platform"],
                     "title": l.get("title", "Unknown"),
-                    "price": float(l.get("price", 0)),
+                    "price": _parse_price(l.get("price", 0)),
                     "seller": l.get("seller", "Unknown"),
                     "url": l.get("url"),
                     "status": "pending",
@@ -133,7 +274,7 @@ async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
                 })
 
                 # Build evidence from discovery data for rules-based classification
-                price = float(listing.get("price", 0))
+                price = _parse_price(listing.get("price", 0))
                 evidence = {
                     "listing": {
                         "title": listing.get("title", ""),
