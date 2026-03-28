@@ -75,6 +75,8 @@ export default function App() {
               listings={scan.listings}
               stats={scan.stats}
               isScanning={scan.state === 'scanning'}
+              progressMessage={scan.progressMessage}
+              progressLog={scan.progressLog}
             />
           </div>
         )}
@@ -99,7 +101,7 @@ export default function App() {
               aggregateStats={dashboard.aggregateStats}
               isLive={dashboard.isLive}
               progressMessage={dashboard.progressMessage}
-              activeStream={dashboard.activeStream}
+              activeStreams={dashboard.activeStreams}
               agentNarration={dashboard.agentNarration}
               onScanAll={dashboard.scanAll}
             />

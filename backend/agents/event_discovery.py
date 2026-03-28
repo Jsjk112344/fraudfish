@@ -16,11 +16,7 @@ import asyncio
 import logging
 from typing import AsyncGenerator
 
-from agents.base import (
-    tinyfish_extract_with_streaming,
-    tinyfish_extract_batch,
-    TinyFishResult,
-)
+from agents.base import tinyfish_extract_with_streaming, TinyFishResult
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +32,10 @@ SISTIC_LINKS_GOAL = (
 )
 
 TICKETMASTER_SG_LINKS_GOAL = (
-    "Browse the Ticketmaster Singapore site and find upcoming events. "
-    "For each event, extract a JSON array with keys: "
-    "event_name (text), url (the link to the event detail page), "
+    "Step 1: Wait for the page to fully load. If there is a cookie banner, dismiss it first. "
+    "Step 2: Browse the Ticketmaster Singapore site and find upcoming events. "
+    "Step 3: For each event, extract a JSON array with keys: "
+    "event_name (text), url (the full link to the event detail page), "
     "popularity_hint (any badge text like 'Sold Out', 'Hot', 'Popular' or null). "
     "Return up to 20 events. Focus on getting the URLs right."
 )
@@ -64,12 +61,16 @@ def _build_event_detail_goal(event_name: str) -> str:
 HIGH_RISK_CATEGORIES = {"concert", "sports"}
 KPOP_KEYWORDS = {
     "blackpink", "bts", "twice", "stray kids", "day6", "g)i-dle", "gidle",
-    "ive", "aespa", "seventeen", "nct", "ateez", "enhypen", "le sserafim",
-    "itzy", "txt", "newjeans", "apink",
+    "i-dle", "idle", "ive", "aespa", "seventeen", "nct", "ateez", "enhypen",
+    "le sserafim", "itzy", "txt", "newjeans", "apink", "treasure", "woodz",
+    "natori", "zutomayo", "laufey", "bus fancon",
 }
 HIGH_DEMAND_KEYWORDS = {
     "taylor swift", "coldplay", "bruno mars", "ed sheeran", "f1",
     "grand prix", "formula 1", "billie eilish", "dua lipa", "adele",
+    "guns n' roses", "guns n roses", "lany", "harry potter", "cirque du soleil",
+    "les mis", "g.e.m", "rainie yang", "eric chou", "周興哲",
+    "world tour", "asia tour",
 }
 
 
@@ -207,6 +208,24 @@ def _normalize_links(raw: dict | list | None) -> list[dict]:
     return [item for item in items if isinstance(item, dict) and item.get("url")]
 
 
+def _guess_category(event_name: str) -> str:
+    """Guess event category from name keywords. Good enough for risk scoring."""
+    name_lower = event_name.lower()
+    if any(kw in name_lower for kw in ("f1", "grand prix", "rugby", "football", "basketball", "tennis")):
+        return "sports"
+    if any(kw in name_lower for kw in ("festival", "fest ")):
+        return "festival"
+    if any(kw in name_lower for kw in ("comedy", "stand-up", "standup", "masala")):
+        return "comedy"
+    if any(kw in name_lower for kw in ("theatre", "theater", "musical", "ballet", "opera", "les mis", "bfg", "roald dahl")):
+        return "theatre"
+    # Immersive experiences / exhibitions — still high-value tickets
+    if any(kw in name_lower for kw in ("harry potter", "cirque du soleil", "disney", "visions of magic")):
+        return "concert"  # Treat as concert-level risk
+    # Default to concert — most ticket events are music
+    return "concert"
+
+
 def _normalize_event_detail(raw: dict | list | None, source: str) -> dict | None:
     """Normalize a single event detail extraction."""
     if raw is None:
@@ -238,21 +257,18 @@ def _normalize_events(raw: dict | list | None, source: str) -> list[dict]:
 
 # ---- Two-Phase Discovery ---------------------------------------------------
 
-async def discover_events_parallel(
-    on_streaming_url: callable | None = None,
-    on_progress: callable | None = None,
-) -> AsyncGenerator[dict, None]:
+async def discover_events_parallel() -> AsyncGenerator[dict, None]:
     """Two-phase parallel event discovery.
 
     Phase 1: Fire 2 agents to find event links on SISTIC + Ticketmaster.
+             Streaming URLs are forwarded in real-time via asyncio.Queue.
     Phase 2: Fire N parallel agents (batch API) to extract details per event.
 
     Yields SSE events:
     - agent_streaming: {step, streaming_url}
     - agent_progress: {step, message}
-    - phase1_complete: {source, link_count, links}
-    - phase2_started: {total_events, sources}
-    - event_detail: {event, source}
+    - phase1_complete: {sistic_count, ticketmaster_count}
+    - phase2_started: {total_events}
     - discovery_result: {events, is_live}
     """
 
@@ -262,51 +278,60 @@ async def discover_events_parallel(
         "message": "Phase 1: Scanning SISTIC and Ticketmaster for event links...",
     }}
 
+    # Queue for real-time streaming URL and progress forwarding
+    event_queue: asyncio.Queue[dict] = asyncio.Queue()
+
     # Fire both link discovery agents concurrently
+    # TinyFish agents can take 2-3 min on complex pages — don't timeout prematurely
     sistic_task = asyncio.create_task(
         tinyfish_extract_with_streaming(
             url="https://www.sistic.com.sg",
             goal=SISTIC_LINKS_GOAL,
-            timeout=90.0,
+            timeout=600.0,
+            event_queue=event_queue,
+            step_label="discover_sistic",
         )
     )
+    # Ticketmaster returns 401 to non-browser requests — stealth + proxy needed
     ticketmaster_task = asyncio.create_task(
         tinyfish_extract_with_streaming(
             url="https://www.ticketmaster.sg",
             goal=TICKETMASTER_SG_LINKS_GOAL,
-            timeout=90.0,
+            stealth=True,
+            proxy_country="AU",
+            timeout=600.0,
+            event_queue=event_queue,
+            step_label="discover_ticketmaster",
         )
     )
 
-    # Monitor both tasks and yield streaming_urls as they appear
-    streaming_urls_seen: set[str] = set()
-    tasks = {"sistic": sistic_task, "ticketmaster": ticketmaster_task}
+    # Drain events from both agents in real-time (streaming URLs, progress)
+    streaming_count = 0
+    while not (sistic_task.done() and ticketmaster_task.done()):
+        try:
+            ev = await asyncio.wait_for(event_queue.get(), timeout=2.0)
+            if ev["event"] == "agent_streaming":
+                streaming_count += 1
+                logger.info("Yielding agent_streaming #%d: step=%s url=%s",
+                           streaming_count, ev["data"]["step"], ev["data"]["streaming_url"][:60])
+            yield ev
+        except asyncio.TimeoutError:
+            continue
 
-    while not all(t.done() for t in tasks.values()):
-        await asyncio.sleep(2.0)
-        # Check for streaming URLs from completed or running tasks
-        for name, task in tasks.items():
-            if task.done():
-                result = task.result()
-                if result.streaming_url and result.streaming_url not in streaming_urls_seen:
-                    streaming_urls_seen.add(result.streaming_url)
-                    yield {"event": "agent_streaming", "data": {
-                        "step": f"discover_{name}",
-                        "streaming_url": result.streaming_url,
-                    }}
+    # Drain any remaining queued events
+    while not event_queue.empty():
+        ev = event_queue.get_nowait()
+        if ev["event"] == "agent_streaming":
+            streaming_count += 1
+            logger.info("Yielding agent_streaming #%d (drain): step=%s url=%s",
+                       streaming_count, ev["data"]["step"], ev["data"]["streaming_url"][:60])
+        yield ev
 
-    # Collect results
-    sistic_result: TinyFishResult = sistic_task.result()
-    ticketmaster_result: TinyFishResult = ticketmaster_task.result()
+    logger.info("Total agent_streaming events yielded: %d", streaming_count)
 
-    # Forward any streaming URLs we haven't sent yet
-    for name, result in [("sistic", sistic_result), ("ticketmaster", ticketmaster_result)]:
-        if result.streaming_url and result.streaming_url not in streaming_urls_seen:
-            streaming_urls_seen.add(result.streaming_url)
-            yield {"event": "agent_streaming", "data": {
-                "step": f"discover_{name}",
-                "streaming_url": result.streaming_url,
-            }}
+    # Collect results (await to propagate exceptions)
+    sistic_result: TinyFishResult = await sistic_task
+    ticketmaster_result: TinyFishResult = await ticketmaster_task
 
     sistic_links = _normalize_links(sistic_result.data)
     ticketmaster_links = _normalize_links(ticketmaster_result.data)
@@ -321,23 +346,37 @@ async def discover_events_parallel(
         "ticketmaster_count": len(ticketmaster_links),
     }}
 
-    # ---- Phase 2: Parallel Detail Extraction (batch API) -------------------
+    # ---- Build event list from link data (no Phase 2 needed) -----------------
+    # Link discovery already gives us event_name + popularity_hint which is
+    # enough for risk scoring. Skipping per-event-page extraction saves
+    # TinyFish runs (account limit: 20 pending, 2 concurrent).
 
-    # Deduplicate by event name
     seen_names: set[str] = set()
-    all_links: list[tuple[dict, str]] = []  # (link_info, source)
+    events: list[dict] = []
     for link in sistic_links:
         name_key = link.get("event_name", "").strip().lower()
         if name_key and name_key not in seen_names:
             seen_names.add(name_key)
-            all_links.append((link, "SISTIC"))
+            events.append({
+                "event_name": link.get("event_name", "Unknown"),
+                "url": link.get("url"),
+                "source": "SISTIC",
+                "category": _guess_category(link.get("event_name", "")),
+                "popularity_hint": link.get("popularity_hint"),
+            })
     for link in ticketmaster_links:
         name_key = link.get("event_name", "").strip().lower()
         if name_key and name_key not in seen_names:
             seen_names.add(name_key)
-            all_links.append((link, "Ticketmaster SG"))
+            events.append({
+                "event_name": link.get("event_name", "Unknown"),
+                "url": link.get("url"),
+                "source": "Ticketmaster SG",
+                "category": _guess_category(link.get("event_name", "")),
+                "popularity_hint": link.get("popularity_hint"),
+            })
 
-    if not all_links:
+    if not events:
         yield {"event": "agent_progress", "data": {
             "step": "discover_links",
             "message": "No event links found from live scraping, using seed data",
@@ -348,72 +387,6 @@ async def discover_events_parallel(
         }}
         return
 
-    yield {"event": "agent_progress", "data": {
-        "step": "extract_details",
-        "message": f"Phase 2: Extracting details for {len(all_links)} events in parallel...",
-    }}
-
-    yield {"event": "phase2_started", "data": {
-        "total_events": len(all_links),
-    }}
-
-    # Build batch tasks — each extracts details from one event page
-    batch_tasks = []
-    for link_info, source in all_links:
-        event_url = link_info["url"]
-        event_name = link_info.get("event_name", "Unknown")
-        batch_tasks.append({
-            "url": event_url,
-            "goal": _build_event_detail_goal(event_name),
-        })
-
-    # Fire all via batch API — true parallel on TinyFish infra
-    streaming_forwarded: set[int] = set()
-
-    def _on_batch_progress(idx: int, status: str, run_data: dict):
-        nonlocal streaming_forwarded
-        # We can't yield from a callback, but we track streaming URLs
-        surl = run_data.get("streaming_url")
-        if surl and idx not in streaming_forwarded:
-            streaming_forwarded.add(idx)
-
-    batch_results = await tinyfish_extract_batch(
-        batch_tasks,
-        timeout=120.0,
-        poll_interval=4.0,
-        on_progress=_on_batch_progress,
-    )
-
-    # Process results
-    events: list[dict] = []
-    for i, (result, (link_info, source)) in enumerate(zip(batch_results, all_links)):
-        detail = _normalize_event_detail(result.data if isinstance(result, TinyFishResult) else result, source)
-        if detail:
-            # Preserve popularity_hint from Phase 1 if Phase 2 didn't find one
-            if not detail.get("popularity_hint") and link_info.get("popularity_hint"):
-                detail["popularity_hint"] = link_info["popularity_hint"]
-            events.append(detail)
-
-            yield {"event": "agent_progress", "data": {
-                "step": "extract_details",
-                "message": f"Extracted: {detail.get('event_name', 'Unknown')} ({source})",
-            }}
-
-            # Forward streaming URL if available
-            if isinstance(result, TinyFishResult) and result.streaming_url:
-                yield {"event": "agent_streaming", "data": {
-                    "step": "extract_details",
-                    "streaming_url": result.streaming_url,
-                }}
-        else:
-            # Fallback: use link info as a minimal event
-            events.append({
-                "event_name": link_info.get("event_name", "Unknown"),
-                "source": source,
-                "category": "other",
-                "popularity_hint": link_info.get("popularity_hint"),
-            })
-
     is_live = len(events) >= 3
     if not is_live:
         for ev in SEED_EVENTS:
@@ -421,6 +394,11 @@ async def discover_events_parallel(
             if name_key not in seen_names:
                 seen_names.add(name_key)
                 events.append(ev)
+
+    yield {"event": "agent_progress", "data": {
+        "step": "discover_links",
+        "message": f"Compiled {len(events)} events for risk ranking",
+    }}
 
     yield {"event": "discovery_result", "data": {
         "events": events,

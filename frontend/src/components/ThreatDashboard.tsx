@@ -9,7 +9,7 @@ interface ThreatDashboardProps {
   aggregateStats: DashboardAggregateStats;
   isLive: boolean;
   progressMessage: string | null;
-  activeStream: AgentStream | null;
+  activeStreams: AgentStream[];
   agentNarration: AgentProgress[];
   onScanAll: () => void;
 }
@@ -20,7 +20,7 @@ export function ThreatDashboard({
   aggregateStats,
   isLive,
   progressMessage,
-  activeStream,
+  activeStreams,
   agentNarration,
   onScanAll,
 }: ThreatDashboardProps) {
@@ -174,20 +174,20 @@ export function ThreatDashboard({
         ))}
       </div>
 
-      {/* Discovering state */}
-      {state === 'discovering' && (
-        <div className="flex flex-col gap-6">
-          {/* Live browser preview */}
-          {(activeStream || agentNarration.length > 0) && (
+      {/* Live Agent Preview — shown during discovering AND scanning */}
+      {(state === 'discovering' || state === 'scanning') && (
+        <div className="flex flex-col gap-6 mb-6">
+          {/* Live browser preview(s) */}
+          {(activeStreams.length > 0 || agentNarration.length > 0) && (
             <LivePreview
-              stream={activeStream}
+              streams={activeStreams}
               narration={agentNarration}
               label={progressMessage || undefined}
             />
           )}
 
           {/* Fallback when no stream yet */}
-          {!activeStream && agentNarration.length === 0 && (
+          {activeStreams.length === 0 && agentNarration.length === 0 && (
             <div className="flex flex-col items-center justify-center min-h-[200px] text-center">
               <div className="relative mb-6">
                 <span className="material-symbols-outlined text-6xl text-primary/30 animate-pulse">
@@ -195,10 +195,10 @@ export function ThreatDashboard({
                 </span>
               </div>
               <h2 className="text-xl font-headline font-bold text-on-surface">
-                Scanning for Events
+                {state === 'discovering' ? 'Scanning for Events' : 'Scanning Marketplaces'}
               </h2>
               <p className="text-sm font-body text-on-surface-variant max-w-md mt-2">
-                {progressMessage || 'Launching TinyFish agents to scan SISTIC and Ticketmaster SG...'}
+                {progressMessage || 'Launching TinyFish agents...'}
               </p>
             </div>
           )}

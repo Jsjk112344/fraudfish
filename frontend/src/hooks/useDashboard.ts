@@ -25,7 +25,7 @@ export function useDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [isLive, setIsLive] = useState(false);
   const [progressMessage, setProgressMessage] = useState<string | null>(null);
-  const [activeStream, setActiveStream] = useState<AgentStream | null>(null);
+  const [activeStreams, setActiveStreams] = useState<AgentStream[]>([]);
   const [agentNarration, setAgentNarration] = useState<AgentProgress[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -41,7 +41,16 @@ export function useDashboard() {
             step: event.data.step as string,
             streaming_url: event.data.streaming_url as string,
           };
-          setActiveStream(stream);
+          console.log('[SSE] agent_streaming:', stream.step, stream.streaming_url.slice(0, 60));
+          // Track multiple streams — add if URL not already tracked
+          setActiveStreams((prev) => {
+            const isDuplicate = prev.some((s) => s.streaming_url === stream.streaming_url);
+            console.log('[SSE] activeStreams before:', prev.length, 'isDuplicate:', isDuplicate);
+            if (isDuplicate) return prev;
+            const next = [...prev, stream];
+            console.log('[SSE] activeStreams after:', next.length);
+            return next;
+          });
           break;
         }
 
@@ -50,7 +59,7 @@ export function useDashboard() {
             step: event.data.step as string,
             message: event.data.message as string,
           };
-          setAgentNarration((prev) => [...prev.slice(-19), progress]); // Keep last 20
+          setAgentNarration((prev) => [...prev.slice(-19), progress]);
           break;
         }
 
@@ -58,14 +67,14 @@ export function useDashboard() {
           const discovered = (event.data.events as unknown as DiscoveredEvent[]) || [];
           setEvents(discovered);
           setIsLive(event.data.is_live as boolean);
-          setActiveStream(null); // Clear preview once discovery is done
+          // Don't clear streams — let discovery_complete handle it
           break;
         }
 
         case 'discovery_complete':
           setState('discovered');
           setProgressMessage(null);
-          setActiveStream(null);
+          setActiveStreams([]);
           break;
       }
     },
@@ -75,6 +84,22 @@ export function useDashboard() {
   const handleScanEvent = useCallback(
     (event: { event: string; data: Record<string, unknown> }) => {
       switch (event.event) {
+        case 'agent_streaming': {
+          const stream: AgentStream = {
+            step: event.data.step as string,
+            streaming_url: event.data.streaming_url as string,
+          };
+          setActiveStreams((prev) => {
+            if (prev.some((s) => s.streaming_url === stream.streaming_url)) return prev;
+            return [...prev, stream];
+          });
+          break;
+        }
+
+        case 'scan_progress':
+          setProgressMessage(event.data.message as string);
+          break;
+
         case 'event_scan_started': {
           const eventId = event.data.event_id as string;
           setEvents((prev) =>
@@ -152,7 +177,7 @@ export function useDashboard() {
     setError(null);
     setIsLive(false);
     setProgressMessage(null);
-    setActiveStream(null);
+    setActiveStreams([]);
     setAgentNarration([]);
     setState('discovering');
 
@@ -222,6 +247,7 @@ export function useDashboard() {
     setAggregateStats(EMPTY_AGGREGATE);
     setError(null);
     setProgressMessage(null);
+    setActiveStreams([]);
   }, []);
 
   return {
@@ -231,7 +257,7 @@ export function useDashboard() {
     error,
     isLive,
     progressMessage,
-    activeStream,
+    activeStreams,
     agentNarration,
     discover,
     scanAll,

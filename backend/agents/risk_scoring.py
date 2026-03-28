@@ -1,156 +1,204 @@
-"""Risk scoring engine: rank discovered events by fraud/scalping probability."""
+"""Risk scoring engine: rank discovered events by fraud/scalping probability.
+
+Uses OpenAI gpt-4o-mini to intelligently assess fraud risk based on event
+characteristics, artist fame, genre, and Singapore market context.
+Falls back to rule-based scoring if the API call fails.
+"""
 
 from __future__ import annotations
 
+import json
 import logging
-import re
-
-from agents.event_discovery import HIGH_RISK_CATEGORIES, KPOP_KEYWORDS, HIGH_DEMAND_KEYWORDS
+import os
 
 logger = logging.getLogger(__name__)
 
-# ---- Scoring weights (out of 100) ------------------------------------------
+# ---- OpenAI client (lazy init) ---------------------------------------------
 
-# Maximum contribution from each factor
-W_SOLD_OUT = 25        # Sold out = highest scalping incentive
-W_FACE_VALUE = 20      # Higher face value = more fraud incentive
-W_CATEGORY = 15        # Concert/sports > theatre > other
-W_DEMAND_KEYWORD = 15  # Known high-demand acts/events
-W_KPOP = 10            # K-pop has disproportionate resale fraud in SG
-W_POPULARITY_HINT = 10 # "Selling Fast", "Limited" etc.
-W_DATE_PROXIMITY = 5   # Closer events = more active fraud window
+_openai_client = None
 
 
-def _parse_face_value_high(event: dict) -> float:
-    """Extract highest face value, handling None/string/number."""
-    for key in ("face_value_high", "face_value_low"):
-        val = event.get(key)
-        if val is not None:
-            try:
-                return float(val)
-            except (ValueError, TypeError):
-                continue
-    return 0.0
+def _get_client():
+    global _openai_client
+    if _openai_client is None:
+        from openai import AsyncOpenAI
+        _openai_client = AsyncOpenAI()
+    return _openai_client
 
 
-def _popularity_hint_score(hint: str | None) -> float:
-    """Score the popularity hint text (0.0 to 1.0)."""
-    if not hint:
-        return 0.0
-    hint_lower = hint.lower()
-    if any(kw in hint_lower for kw in ("sold out", "soldout")):
-        return 1.0
-    if any(kw in hint_lower for kw in ("selling fast", "limited", "few left", "hot")):
-        return 0.7
-    if any(kw in hint_lower for kw in ("popular", "trending", "recommended")):
-        return 0.4
-    return 0.1  # Has some hint but not strong
+# ---- LLM-based scoring (primary) -------------------------------------------
+
+SCORING_PROMPT = """\
+You are a ticket fraud risk analyst specializing in Singapore's secondary ticket market.
+
+For each event below, estimate a fraud/scalping risk score from 0 to 100 based on:
+- **Artist/act fame & demand**: Global superstars and viral K-pop acts score higher
+- **Genre risk**: K-pop, pop concerts, and major sports have the highest resale fraud in Singapore
+- **Tour type**: World tours and limited Singapore dates create scarcity
+- **Ticket price expectations**: Premium events (>S$200) attract more fraud
+- **Singapore market context**: Events that Singaporean fans are desperate for
+- **Sold-out likelihood**: Acts known to sell out instantly score higher
+
+Score guide:
+- 70-100 CRITICAL: Massive global act, certain to sell out, guaranteed scalping (e.g. Taylor Swift, BTS, F1 GP)
+- 50-69 HIGH: Very popular act, likely sells out, active resale market (e.g. IVE, Coldplay, Guns N' Roses)
+- 30-49 MODERATE: Popular act with some resale activity (e.g. niche K-pop, regional artists)
+- 0-29 LOW: Niche/local act, unlikely significant fraud (e.g. comedy shows, small venues)
+
+Return a JSON array with one object per event: {"index": <number>, "score": <number>, "reason": "<brief 5-10 word reason>"}
+Return ONLY the JSON array, no markdown formatting."""
 
 
-def _date_proximity_score(date_str: str | None) -> float:
-    """Score how close the event date is (closer = higher fraud risk).
+async def score_events_with_llm(events: list[dict]) -> list[dict]:
+    """Score events using OpenAI gpt-4o-mini for intelligent risk assessment."""
+    client = _get_client()
 
-    Returns 0.0 to 1.0.  Rough parsing — we just need a signal, not precision.
-    """
-    if not date_str:
-        return 0.3  # Unknown date gets moderate score
+    # Build event list for the prompt
+    event_lines = []
+    for i, ev in enumerate(events):
+        name = ev.get("event_name", "Unknown")
+        category = ev.get("category", "other")
+        hint = ev.get("popularity_hint") or "none"
+        sold_out = ev.get("sold_out")
+        face_low = ev.get("face_value_low")
+        face_high = ev.get("face_value_high")
+        price_str = ""
+        if face_low or face_high:
+            price_str = f", price: S${face_low or '?'}-S${face_high or '?'}"
+        sold_str = ""
+        if sold_out is True:
+            sold_str = ", SOLD OUT"
+        elif sold_out is False:
+            sold_str = ", on sale"
 
-    date_lower = date_str.lower()
+        event_lines.append(
+            f"{i}. {name} (category: {category}, hint: {hint}{price_str}{sold_str})"
+        )
 
-    # Check for month mentions to estimate proximity
-    months = [
-        "january", "february", "march", "april", "may", "june",
-        "july", "august", "september", "october", "november", "december",
-    ]
-    month_short = [
-        "jan", "feb", "mar", "apr", "may", "jun",
-        "jul", "aug", "sep", "oct", "nov", "dec",
-    ]
+    event_text = "\n".join(event_lines)
 
-    for i, (full, short) in enumerate(zip(months, month_short)):
-        if full in date_lower or short in date_lower:
-            # Rough check: is it within ~2 months?
-            # We don't need to be exact, just need a signal
-            from datetime import datetime
-            current_month = datetime.now().month
-            event_month = i + 1
-            # Handle year wrap
-            diff = event_month - current_month
-            if diff < 0:
-                diff += 12
-            if diff <= 1:
-                return 1.0  # This month or next
-            if diff <= 3:
-                return 0.7
-            if diff <= 6:
-                return 0.4
-            return 0.2
+    try:
+        resp = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": SCORING_PROMPT},
+                {"role": "user", "content": f"Score these {len(events)} events in Singapore:\n\n{event_text}"},
+            ],
+            temperature=0.3,
+            max_tokens=2000,
+        )
 
-    return 0.3  # Can't parse, moderate score
+        raw = resp.choices[0].message.content.strip()
+        # Strip markdown code fences if present
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
+
+        scores = json.loads(raw)
+
+        # Apply scores to events
+        score_map = {item["index"]: item for item in scores if isinstance(item, dict)}
+        for i, ev in enumerate(events):
+            if i in score_map:
+                ev["risk_score"] = max(0, min(100, float(score_map[i]["score"])))
+                ev["ai_reason"] = score_map[i].get("reason", "")
+            else:
+                # Fallback for missing entries
+                ev["risk_score"] = _rule_based_score(ev)
+
+        logger.info("LLM scored %d events (model: gpt-4o-mini)", len(events))
+        return events
+
+    except Exception as e:
+        logger.warning("LLM scoring failed: %s — falling back to rules", e)
+        for ev in events:
+            ev["risk_score"] = _rule_based_score(ev)
+        return events
 
 
-def score_event(event: dict) -> float:
-    """Compute a fraud risk score (0-100) for a discovered event.
+# ---- Rule-based fallback ---------------------------------------------------
 
-    Higher score = higher probability of scalping/fraud activity.
-    """
+def _rule_based_score(event: dict) -> float:
+    """Quick rule-based score as fallback when LLM is unavailable."""
     score = 0.0
     name_lower = (event.get("event_name") or "").lower()
     category = (event.get("category") or "other").lower()
 
-    # 1. Sold out status (strongest signal)
+    # Sold out
     sold_out = event.get("sold_out")
     if sold_out is True:
-        score += W_SOLD_OUT
+        score += 25
     elif sold_out is None:
-        score += W_SOLD_OUT * 0.3  # Unknown = some risk
+        score += 7.5
 
-    # 2. Face value (higher = more incentive for fraud)
-    face_value = _parse_face_value_high(event)
-    if face_value >= 500:
-        score += W_FACE_VALUE
-    elif face_value >= 300:
-        score += W_FACE_VALUE * 0.8
-    elif face_value >= 150:
-        score += W_FACE_VALUE * 0.5
-    elif face_value >= 50:
-        score += W_FACE_VALUE * 0.2
+    # Face value
+    fv = 0.0
+    for key in ("face_value_high", "face_value_low"):
+        val = event.get(key)
+        if val is not None:
+            try:
+                fv = float(val)
+                break
+            except (ValueError, TypeError):
+                continue
+    if fv >= 500:
+        score += 20
+    elif fv >= 300:
+        score += 16
+    elif fv >= 150:
+        score += 10
 
-    # 3. Event category
-    if category in HIGH_RISK_CATEGORIES:
-        score += W_CATEGORY
+    # Category
+    if category in ("concert", "sports"):
+        score += 15
     elif category in ("festival", "theatre"):
-        score += W_CATEGORY * 0.4
+        score += 6
 
-    # 4. High-demand keyword match
-    if any(kw in name_lower for kw in HIGH_DEMAND_KEYWORDS):
-        score += W_DEMAND_KEYWORD
+    # Tour
+    if any(kw in name_lower for kw in ("world tour", "asia tour")):
+        score += 10
+    elif "tour" in name_lower:
+        score += 5
 
-    # 5. K-pop (disproportionate resale fraud in SG)
-    if any(kw in name_lower for kw in KPOP_KEYWORDS):
-        score += W_KPOP
-
-    # 6. Popularity hint
-    score += W_POPULARITY_HINT * _popularity_hint_score(event.get("popularity_hint"))
-
-    # 7. Date proximity
-    score += W_DATE_PROXIMITY * _date_proximity_score(event.get("date"))
+    # Popularity hint
+    hint = (event.get("popularity_hint") or "").lower()
+    if "sold out" in hint:
+        score += 10
+    elif any(kw in hint for kw in ("selling fast", "limited", "hot")):
+        score += 7
 
     return round(min(score, 100.0), 1)
 
 
-def rank_events(events: list[dict]) -> list[dict]:
+# ---- Public API -----------------------------------------------------------
+
+async def rank_events(events: list[dict]) -> list[dict]:
     """Score and rank events by fraud risk (highest first).
 
+    Uses OpenAI gpt-4o-mini for intelligent scoring, falls back to rules.
     Mutates each event dict by adding 'risk_score' and 'risk_level' keys.
     """
+    if not events:
+        return events
+
+    # Try LLM scoring if OpenAI key is available
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if api_key and api_key != "your-openai-api-key-here":
+        events = await score_events_with_llm(events)
+    else:
+        for ev in events:
+            ev["risk_score"] = _rule_based_score(ev)
+
+    # Assign risk levels
     for ev in events:
-        ev["risk_score"] = score_event(ev)
-        if ev["risk_score"] >= 70:
+        score = ev.get("risk_score", 0)
+        if score >= 70:
             ev["risk_level"] = "CRITICAL"
-        elif ev["risk_score"] >= 50:
+        elif score >= 50:
             ev["risk_level"] = "HIGH"
-        elif ev["risk_score"] >= 30:
+        elif score >= 30:
             ev["risk_level"] = "MODERATE"
         else:
             ev["risk_level"] = "LOW"

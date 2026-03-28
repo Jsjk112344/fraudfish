@@ -18,6 +18,8 @@ export function useEventScan() {
   const [listings, setListings] = useState<ScanListing[]>([]);
   const [stats, setStats] = useState<ScanStats>(EMPTY_STATS);
   const [error, setError] = useState<string | null>(null);
+  const [progressMessage, setProgressMessage] = useState<string | null>(null);
+  const [progressLog, setProgressLog] = useState<Array<{ phase: string; message: string }>>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   const handleEvent = useCallback((event: { event: string; data: Record<string, unknown> }) => {
@@ -25,6 +27,14 @@ export function useEventScan() {
       case 'scan_started':
         // Already in scanning state from start()
         break;
+
+      case 'scan_progress': {
+        const msg = event.data.message as string;
+        const phase = (event.data.phase as string) || 'general';
+        setProgressMessage(msg);
+        setProgressLog((prev) => [...prev.slice(-29), { phase, message: msg }]);
+        break;
+      }
 
       case 'listings_found': {
         const foundListings = (event.data.listings as Array<Record<string, unknown>>) || [];
@@ -75,6 +85,7 @@ export function useEventScan() {
       case 'scan_complete': {
         const finalStats = event.data.final_stats as unknown as ScanStats;
         if (finalStats) setStats(finalStats);
+        setProgressMessage(null);
         setState('complete');
         break;
       }
@@ -89,6 +100,8 @@ export function useEventScan() {
     setListings([]);
     setStats(EMPTY_STATS);
     setError(null);
+    setProgressMessage(null);
+    setProgressLog([]);
     setState('scanning');
 
     const controller = new AbortController();
@@ -117,8 +130,10 @@ export function useEventScan() {
     setListings([]);
     setStats(EMPTY_STATS);
     setError(null);
+    setProgressMessage(null);
+    setProgressLog([]);
     setState('idle');
   }, []);
 
-  return { state, listings, stats, error, start, cancel };
+  return { state, listings, stats, error, progressMessage, progressLog, start, cancel };
 }

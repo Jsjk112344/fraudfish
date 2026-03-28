@@ -39,10 +39,18 @@ async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
     yield {"event": "scan_started", "data": {"event_name": event_name, "platforms": ["Carousell", "Viagogo"]}}
 
     # Phase 1: Discovery -- use async batch API for true parallel execution
+    yield {"event": "scan_progress", "data": {
+        "phase": "discovery",
+        "message": f"Launching agents to search Carousell and Viagogo for '{event_name}'...",
+    }}
     try:
         carousell_listings, viagogo_listings = await scan_markets_batch(event_name)
     except Exception as e:
         logger.warning("Batch discovery failed: %s, trying sequential fallback", e)
+        yield {"event": "scan_progress", "data": {
+            "phase": "discovery",
+            "message": "Batch search failed, retrying with sequential agents...",
+        }}
         try:
             carousell_listings, viagogo_listings = await asyncio.gather(
                 scan_carousell_market(event_name, "tickets"),
@@ -82,24 +90,44 @@ async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
     }
 
     if not all_listings:
+        yield {"event": "scan_progress", "data": {
+            "phase": "discovery",
+            "message": "No listings found on any platform.",
+        }}
         yield {"event": "scan_complete", "data": {
             "final_stats": ScanStats(by_platform=by_platform).model_dump(),
             "duration_seconds": round(time.time() - start_time, 1),
         }}
         return
 
+    yield {"event": "scan_progress", "data": {
+        "phase": "discovery",
+        "message": f"Found {len(all_listings)} listings across {sum(1 for v in by_platform.values() if v > 0)} platforms. Starting fraud analysis...",
+    }}
+
     # Phase 2: Investigate with bounded concurrency
     stats = ScanStats(total_listings=len(all_listings), by_platform=by_platform)
     results_lock = asyncio.Lock()
+    event_queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
     sem = asyncio.Semaphore(CONCURRENCY)
+    CLASSIFY_TIMEOUT = 30.0  # seconds — prevent LLM hangs from blocking the pipeline
 
     async def investigate_one(listing: dict):
         listing_id = listing["listing_id"]
         async with sem:
-            yield_events = []
             try:
-                yield_events.append({
+                platform = listing.get("platform", "Unknown")
+                seller = listing.get("seller", "Unknown")
+                await event_queue.put({
+                    "event": "scan_progress",
+                    "data": {
+                        "phase": "investigating",
+                        "message": f"Investigating {platform} listing by '{seller}' — classifying evidence...",
+                        "listing_id": listing_id,
+                    },
+                })
+                await event_queue.put({
                     "event": "listing_update",
                     "data": {"listing_id": listing_id, "status": "investigating"},
                 })
@@ -117,7 +145,7 @@ async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
                     "seller": {},
                 }
 
-                verdict = await classify(evidence)
+                verdict = await asyncio.wait_for(classify(evidence), timeout=CLASSIFY_TIMEOUT)
 
                 # Update stats
                 async with results_lock:
@@ -135,7 +163,7 @@ async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
                 if hasattr(verdict_data.get("category"), "value"):
                     verdict_data["category"] = verdict_data["category"].value
 
-                yield_events.append({
+                await event_queue.put({
                     "event": "listing_verdict",
                     "data": {
                         "listing_id": listing_id,
@@ -148,32 +176,58 @@ async def run_event_scan(event_name: str) -> AsyncGenerator[dict, None]:
                         },
                     },
                 })
-                yield_events.append({
+                await event_queue.put({
                     "event": "scan_stats",
                     "data": stats.model_dump(),
                 })
 
+            except asyncio.TimeoutError:
+                logger.warning("Classification timed out for %s", listing_id)
+                await event_queue.put({
+                    "event": "listing_update",
+                    "data": {"listing_id": listing_id, "status": "error", "error": "Classification timed out"},
+                })
+                async with results_lock:
+                    stats.investigated += 1
+                await event_queue.put({"event": "scan_stats", "data": stats.model_dump()})
+
             except Exception as e:
                 logger.warning("Investigation failed for %s: %s", listing_id, e)
-                yield_events.append({
+                await event_queue.put({
                     "event": "listing_update",
                     "data": {"listing_id": listing_id, "status": "error", "error": str(e)},
                 })
                 async with results_lock:
                     stats.investigated += 1
-                yield_events.append({
-                    "event": "scan_stats",
-                    "data": stats.model_dump(),
-                })
+                await event_queue.put({"event": "scan_stats", "data": stats.model_dump()})
 
-            return yield_events
+    # Run all investigations as tasks, drain events from queue as they arrive
+    tasks = [asyncio.create_task(investigate_one(l)) for l in all_listings]
 
-    # Run investigations with bounded concurrency, yielding events as they complete
-    tasks = [investigate_one(l) for l in all_listings]
-    for coro in asyncio.as_completed(tasks):
-        events = await coro
-        for ev in events:
-            yield ev
+    try:
+        done_count = 0
+        total = len(tasks)
+        while done_count < total:
+            try:
+                ev = await asyncio.wait_for(event_queue.get(), timeout=2.0)
+                if ev is not None:
+                    yield ev
+            except asyncio.TimeoutError:
+                pass
+            # Check how many tasks have finished
+            done_count = sum(1 for t in tasks if t.done())
+
+        # Drain any remaining events in the queue
+        while not event_queue.empty():
+            ev = event_queue.get_nowait()
+            if ev is not None:
+                yield ev
+    finally:
+        # Cancel any still-running tasks to prevent orphans
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     yield {"event": "scan_complete", "data": {
         "final_stats": stats.model_dump(),

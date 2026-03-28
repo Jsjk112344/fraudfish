@@ -2,27 +2,29 @@
 
 Uses two-phase parallel discovery:
   Phase 1: Quick agents find event links on SISTIC + Ticketmaster
-  Phase 2: Batch API fires parallel agents to extract details per event
+  Scan:    Batch-fire all marketplace searches upfront, classify as results arrive
+
+TinyFish limits: 2 concurrent sessions, 20 max pending.
+We budget: 2 runs for discovery + up to 10 for scanning (5 events × 2 platforms).
 """
 
 import asyncio
 import logging
 import time
 from typing import AsyncGenerator
+from urllib.parse import quote
 
 from agents.event_discovery import discover_events_parallel, SEED_EVENTS
 from agents.risk_scoring import rank_events
-from agents.market_scan import scan_carousell_market, scan_viagogo_market
 from agents.base import tinyfish_extract_batch, TinyFishResult
 from classify import classify
 from models.events import ScanStats
 
 logger = logging.getLogger(__name__)
 
-# Dashboard-specific limits
-MAX_EVENTS_TO_SCAN = 6    # Top N riskiest events to auto-scan
-MAX_LISTINGS_PER_EVENT = 8  # Cap per event for dashboard speed
-CONCURRENCY = 3             # TinyFish session limit
+# Dashboard-specific limits — tuned for 2-concurrency / 20-pending TinyFish account
+MAX_EVENTS_TO_SCAN = 5     # Top N riskiest events (5 × 2 platforms = 10 runs)
+MAX_LISTINGS_PER_EVENT = 8  # Cap per event for demo speed
 
 
 async def run_dashboard_discovery() -> AsyncGenerator[dict, None]:
@@ -82,7 +84,7 @@ async def run_dashboard_discovery() -> AsyncGenerator[dict, None]:
             is_live = ev["data"]["is_live"]
 
     # Rank by risk
-    ranked = rank_events(events)
+    ranked = await rank_events(events)
 
     yield {"event": "events_discovered", "data": {
         "events": [
@@ -111,13 +113,25 @@ async def run_dashboard_discovery() -> AsyncGenerator[dict, None]:
     }}
 
 
-async def run_dashboard_scan(events: list[dict]) -> AsyncGenerator[dict, None]:
-    """Phase 2: Scan top-risk events for fraudulent listings.
+def _normalize_listings(result) -> list[dict]:
+    """Normalize TinyFish extraction result to a list of listing dicts."""
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        return result.get("listings") or result.get("results") or []
+    return []
 
-    Accepts pre-ranked events (from discovery). Scans the top N.
+
+async def run_dashboard_scan(events: list[dict]) -> AsyncGenerator[dict, None]:
+    """Scan top-risk events for fraudulent listings.
+
+    Fires ALL marketplace searches upfront as one batch (5 events × 2 platforms
+    = 10 runs, within the 20-pending TinyFish limit). TinyFish queues them
+    and runs 2 at a time. Results are processed as they complete.
 
     SSE events yielded:
     - dashboard_scan_started: {event_count, events}
+    - scan_progress: {message}
     - event_scan_started: {event_id, event_name}
     - event_listings_found: {event_id, listings, count}
     - event_listing_verdict: {event_id, listing_id, verdict}
@@ -135,7 +149,97 @@ async def run_dashboard_scan(events: list[dict]) -> AsyncGenerator[dict, None]:
         ],
     }}
 
-    # Aggregate stats across all events
+    # ---- Batch-fire all marketplace searches upfront -----------------------
+    # Build tasks: for each event, one Carousell search + one Viagogo search
+    batch_tasks: list[dict] = []
+    task_map: list[tuple[dict, str]] = []  # (event, platform)
+
+    for ev in top_events:
+        event_name = ev["event_name"]
+        # Carousell search
+        batch_tasks.append({
+            "url": f"https://www.carousell.sg/search/{quote(event_name)}",
+            "goal": (
+                f"Search for '{event_name}' tickets. "
+                "Extract a JSON array of listings with keys: title, price, seller."
+            ),
+        })
+        task_map.append((ev, "Carousell"))
+        # Viagogo search
+        batch_tasks.append({
+            "url": "https://www.viagogo.com/",
+            "goal": (
+                f"Search for '{event_name}' tickets. "
+                "Extract a JSON array of listings with keys: title, price, seller."
+            ),
+        })
+        task_map.append((ev, "Viagogo"))
+
+    yield {"event": "scan_progress", "data": {
+        "message": f"Firing {len(batch_tasks)} marketplace searches across {len(top_events)} events...",
+    }}
+
+    # Fire everything — TinyFish queues and runs 2 at a time
+    # Use asyncio.Queue to forward streaming URLs in real-time during polling
+    scan_event_queue: asyncio.Queue[dict] = asyncio.Queue()
+    streaming_urls_forwarded: set[int] = set()
+
+    def _on_scan_progress(idx: int, status: str, run_data: dict):
+        surl = run_data.get("streaming_url")
+        if surl and idx not in streaming_urls_forwarded:
+            streaming_urls_forwarded.add(idx)
+            ev, platform = task_map[idx]
+            scan_event_queue.put_nowait({
+                "event": "agent_streaming",
+                "data": {
+                    "step": f"scan_{platform.lower()}",
+                    "streaming_url": surl,
+                },
+            })
+
+    # Run batch in a task so we can drain the queue concurrently
+    batch_task = asyncio.create_task(
+        tinyfish_extract_batch(
+            batch_tasks,
+            timeout=600.0,
+            poll_interval=4.0,
+            on_progress=_on_scan_progress,
+        )
+    )
+
+    # Drain streaming URL events while batch runs
+    while not batch_task.done():
+        try:
+            ev = await asyncio.wait_for(scan_event_queue.get(), timeout=2.0)
+            yield ev
+        except asyncio.TimeoutError:
+            continue
+
+    # Drain remaining
+    while not scan_event_queue.empty():
+        yield scan_event_queue.get_nowait()
+
+    batch_results = await batch_task
+
+    yield {"event": "scan_progress", "data": {
+        "message": "All searches complete. Classifying listings...",
+    }}
+
+    # ---- Group results by event and classify --------------------------------
+    event_listings: dict[str, list[dict]] = {}
+    for i, result in enumerate(batch_results):
+        ev, platform = task_map[i]
+        event_id = ev["event_id"]
+        if event_id not in event_listings:
+            event_listings[event_id] = []
+
+        raw_listings = _normalize_listings(result.data) if result.data else []
+        for j, l in enumerate(raw_listings):
+            l["listing_id"] = f"{event_id}-{'car' if platform == 'Carousell' else 'via'}-{j}"
+            l["platform"] = platform
+            event_listings[event_id].append(l)
+
+    # Aggregate stats
     agg = {
         "total_events_scanned": 0,
         "total_listings": 0,
@@ -145,43 +249,18 @@ async def run_dashboard_scan(events: list[dict]) -> AsyncGenerator[dict, None]:
         "by_event": {},
     }
 
-    sem = asyncio.Semaphore(CONCURRENCY)
-
-    async def scan_one_event(ev: dict) -> tuple[list[dict], ScanStats]:
-        """Scan a single event — discover listings then classify."""
+    # Process each event's listings
+    for ev in top_events:
         event_id = ev["event_id"]
         event_name = ev["event_name"]
-        events_to_yield: list[dict] = []
+        all_listings = event_listings.get(event_id, [])[:MAX_LISTINGS_PER_EVENT]
 
-        events_to_yield.append({"event": "event_scan_started", "data": {
+        yield {"event": "event_scan_started", "data": {
             "event_id": event_id,
             "event_name": event_name,
-        }})
+        }}
 
-        # Discover listings for this event
-        async with sem:
-            try:
-                carousell, viagogo = await asyncio.gather(
-                    scan_carousell_market(event_name, "tickets"),
-                    scan_viagogo_market(event_name),
-                )
-            except Exception as e:
-                logger.warning("Listing discovery failed for %s: %s", event_name, e)
-                carousell, viagogo = [], []
-
-        # Tag listings
-        all_listings: list[dict] = []
-        for i, l in enumerate(carousell):
-            l["listing_id"] = f"{event_id}-car-{i}"
-            l["platform"] = "Carousell"
-            all_listings.append(l)
-        for i, l in enumerate(viagogo):
-            l["listing_id"] = f"{event_id}-via-{i}"
-            l["platform"] = "Viagogo"
-            all_listings.append(l)
-        all_listings = all_listings[:MAX_LISTINGS_PER_EVENT]
-
-        events_to_yield.append({"event": "event_listings_found", "data": {
+        yield {"event": "event_listings_found", "data": {
             "event_id": event_id,
             "listings": [
                 {
@@ -194,7 +273,7 @@ async def run_dashboard_scan(events: list[dict]) -> AsyncGenerator[dict, None]:
                 for l in all_listings
             ],
             "count": len(all_listings),
-        }})
+        }}
 
         # Classify each listing
         event_stats = ScanStats(
@@ -206,58 +285,49 @@ async def run_dashboard_scan(events: list[dict]) -> AsyncGenerator[dict, None]:
         )
 
         for listing in all_listings:
-            async with sem:
-                try:
-                    price = float(listing.get("price", 0))
-                    evidence = {
-                        "listing": {
-                            "title": listing.get("title", ""),
-                            "price": price,
-                            "seller_username": listing.get("seller", ""),
-                            "platform": listing.get("platform", ""),
-                        },
-                        "event": {},
-                        "seller": {},
-                    }
-                    verdict = await classify(evidence)
-                    verdict_data = verdict.model_dump()
+            try:
+                price = float(listing.get("price", 0))
+                evidence = {
+                    "listing": {
+                        "title": listing.get("title", ""),
+                        "price": price,
+                        "seller_username": listing.get("seller", ""),
+                        "platform": listing.get("platform", ""),
+                    },
+                    "event": {},
+                    "seller": {},
+                }
+                verdict = await classify(evidence)
+                verdict_data = verdict.model_dump()
 
-                    cat = verdict.category.value if hasattr(verdict.category, "value") else str(verdict.category)
-                    event_stats.investigated += 1
-                    event_stats.by_category[cat] = event_stats.by_category.get(cat, 0) + 1
-                    if cat in ("SCALPING_VIOLATION", "LIKELY_SCAM", "COUNTERFEIT_RISK"):
-                        event_stats.flagged += 1
-                    if cat in ("LIKELY_SCAM", "COUNTERFEIT_RISK"):
-                        event_stats.confirmed_scams += 1
-                        event_stats.fraud_exposure += price
+                cat = verdict.category.value if hasattr(verdict.category, "value") else str(verdict.category)
+                event_stats.investigated += 1
+                event_stats.by_category[cat] = event_stats.by_category.get(cat, 0) + 1
+                if cat in ("SCALPING_VIOLATION", "LIKELY_SCAM", "COUNTERFEIT_RISK"):
+                    event_stats.flagged += 1
+                if cat in ("LIKELY_SCAM", "COUNTERFEIT_RISK"):
+                    event_stats.confirmed_scams += 1
+                    event_stats.fraud_exposure += price
 
-                    events_to_yield.append({"event": "event_listing_verdict", "data": {
-                        "event_id": event_id,
-                        "listing_id": listing["listing_id"],
-                        "verdict": verdict_data,
-                        "listing_summary": {
-                            "title": listing.get("title", ""),
-                            "price": price,
-                            "seller": listing.get("seller", ""),
-                            "platform": listing.get("platform", ""),
-                        },
-                    }})
-                except Exception as e:
-                    logger.warning("Classification failed for %s: %s", listing.get("listing_id"), e)
-                    event_stats.investigated += 1
+                yield {"event": "event_listing_verdict", "data": {
+                    "event_id": event_id,
+                    "listing_id": listing["listing_id"],
+                    "verdict": verdict_data,
+                    "listing_summary": {
+                        "title": listing.get("title", ""),
+                        "price": price,
+                        "seller": listing.get("seller", ""),
+                        "platform": listing.get("platform", ""),
+                    },
+                }}
+            except Exception as e:
+                logger.warning("Classification failed for %s: %s", listing.get("listing_id"), e)
+                event_stats.investigated += 1
 
-        events_to_yield.append({"event": "event_scan_complete", "data": {
+        yield {"event": "event_scan_complete", "data": {
             "event_id": event_id,
             "stats": event_stats.model_dump(),
-        }})
-
-        return events_to_yield, event_stats
-
-    # Scan events sequentially (each event does parallel listing discovery)
-    for ev in top_events:
-        event_results, event_stats = await scan_one_event(ev)
-        for sse_ev in event_results:
-            yield sse_ev
+        }}
 
         # Accumulate aggregate
         agg["total_events_scanned"] += 1
@@ -265,8 +335,8 @@ async def run_dashboard_scan(events: list[dict]) -> AsyncGenerator[dict, None]:
         agg["total_flagged"] += event_stats.flagged
         agg["total_confirmed_scams"] += event_stats.confirmed_scams
         agg["total_fraud_exposure"] += event_stats.fraud_exposure
-        agg["by_event"][ev["event_id"]] = {
-            "event_name": ev["event_name"],
+        agg["by_event"][event_id] = {
+            "event_name": event_name,
             "risk_score": ev.get("risk_score", 0),
             "stats": event_stats.model_dump(),
         }

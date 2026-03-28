@@ -1,7 +1,7 @@
 import type { AgentStream, AgentProgress } from '../types/dashboard';
 
 interface LivePreviewProps {
-  stream: AgentStream | null;
+  streams: AgentStream[];
   narration: AgentProgress[];
   label?: string;
 }
@@ -14,12 +14,11 @@ const STEP_LABELS: Record<string, string> = {
   verify_event: 'Event Verification',
   check_market: 'Market Scan',
   cross_platform: 'Cross-Platform Search',
+  extract_details: 'Event Details',
 };
 
-export function LivePreview({ stream, narration, label }: LivePreviewProps) {
-  if (!stream && narration.length === 0) return null;
-
-  const stepLabel = stream ? STEP_LABELS[stream.step] || stream.step : '';
+export function LivePreview({ streams, narration, label }: LivePreviewProps) {
+  if (streams.length === 0 && narration.length === 0) return null;
 
   return (
     <div className="glass border border-outline-variant/20 rounded-xl overflow-hidden">
@@ -33,20 +32,36 @@ export function LivePreview({ stream, narration, label }: LivePreviewProps) {
           LIVE
         </span>
         <span className="text-xs text-on-surface-variant font-body">
-          {label || `Agent navigating ${stepLabel}`}
+          {label || `${streams.length} agent${streams.length !== 1 ? 's' : ''} running`}
         </span>
       </div>
 
-      {/* Browser Preview */}
-      {stream?.streaming_url && (
-        <div className="relative w-full" style={{ paddingBottom: '56.25%' }}>
-          <iframe
-            src={stream.streaming_url}
-            title="TinyFish Live Browser Preview"
-            className="absolute inset-0 w-full h-full border-0"
-            allow="autoplay"
-            sandbox="allow-scripts allow-same-origin"
-          />
+      {/* Browser Previews — grid layout for multiple agents */}
+      {streams.length > 0 && (
+        <div className={`grid gap-0 ${streams.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
+          {streams.map((stream, i) => (
+            <div key={stream.streaming_url} className="relative">
+              {/* Stream label */}
+              <div className="absolute top-2 left-2 z-10 flex items-center gap-1.5 bg-black/70 backdrop-blur-sm rounded px-2 py-0.5">
+                <span className="relative flex h-1.5 w-1.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75" />
+                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-green-400" />
+                </span>
+                <span className="text-[9px] uppercase tracking-wider font-mono text-green-300">
+                  {STEP_LABELS[stream.step] || stream.step}
+                </span>
+              </div>
+              <div className="relative w-full" style={{ paddingBottom: streams.length === 1 ? '56.25%' : '65%' }}>
+                <iframe
+                  src={stream.streaming_url}
+                  title={`TinyFish Agent: ${STEP_LABELS[stream.step] || stream.step}`}
+                  className="absolute inset-0 w-full h-full border-0"
+                  allow="autoplay"
+                  sandbox="allow-scripts allow-same-origin"
+                />
+              </div>
+            </div>
+          ))}
         </div>
       )}
 

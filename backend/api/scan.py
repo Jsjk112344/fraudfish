@@ -16,12 +16,16 @@ async def scan_event(request: Request, body: ScanRequest):
     pipeline = run_event_scan(body.event_name)
 
     async def event_generator():
-        async for event in pipeline:
-            if await request.is_disconnected():
-                break
-            yield {
-                "event": event["event"],
-                "data": json.dumps(event["data"]),
-            }
+        try:
+            async for event in pipeline:
+                if await request.is_disconnected():
+                    break
+                yield {
+                    "event": event["event"],
+                    "data": json.dumps(event["data"]),
+                }
+        finally:
+            # Ensure the pipeline generator is closed so it can cancel its tasks
+            await pipeline.aclose()
 
     return EventSourceResponse(event_generator())

@@ -28,7 +28,7 @@ TINYFISH_CANCEL_URL = f"{TINYFISH_BASE}/v1/automation/cancel"
 
 # Default poll settings — generous to avoid false timeouts
 DEFAULT_POLL_INTERVAL = 4.0   # seconds between polls
-DEFAULT_TIMEOUT = 300.0        # 5 minutes — agents take time on Cloudflare sites
+DEFAULT_TIMEOUT = 600.0        # 10 minutes — agents take time on Cloudflare sites, never timeout prematurely
 
 
 def _get_api_key() -> str:
@@ -132,7 +132,9 @@ async def tinyfish_poll_run(
     result = TinyFishResult(run_id=run_id)
     deadline = asyncio.get_event_loop().time() + timeout
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+    ) as client:
         while asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(poll_interval)
             try:
@@ -141,6 +143,7 @@ async def tinyfish_poll_run(
                     headers={"X-API-Key": api_key},
                 )
                 if resp.status_code != 200:
+                    logger.debug("TinyFish poll %s: HTTP %s", run_id[:12], resp.status_code)
                     continue
 
                 run_data = resp.json()
@@ -157,15 +160,16 @@ async def tinyfish_poll_run(
                 if status == "COMPLETED":
                     result.data = run_data.get("result")
                     result.success = result.data is not None
+                    logger.info("TinyFish run %s completed", run_id[:12])
                     return result
                 elif status in ("FAILED", "CANCELLED"):
-                    logger.warning("TinyFish run %s: %s", run_id, status)
+                    logger.warning("TinyFish run %s: %s", run_id[:12], status)
                     return result
 
             except Exception as e:
-                logger.warning("TinyFish poll error for %s: %s", run_id, e)
+                logger.warning("TinyFish poll error for %s: %s", run_id[:12], e)
 
-    logger.warning("TinyFish run %s timed out after %ss", run_id, timeout)
+    logger.warning("TinyFish run %s timed out after %ss", run_id[:12], timeout)
     return result
 
 
@@ -190,16 +194,41 @@ async def tinyfish_extract_with_streaming(
     stealth: bool = False,
     proxy_country: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    event_queue: asyncio.Queue | None = None,
+    step_label: str = "",
 ) -> TinyFishResult:
     """Extraction that also captures the streaming_url for live preview.
 
     Uses async+poll (thread-safe) — streaming_url is available on the
     run object via GET /v1/runs/{id}, no SSE needed.
+
+    If event_queue is provided, pushes agent_streaming events as they're
+    discovered during polling (useful for real-time UI updates).
     """
     run_id = await tinyfish_start_run(url, goal, stealth, proxy_country)
     if not run_id:
         return TinyFishResult()
-    return await tinyfish_poll_run(run_id, timeout=timeout)
+
+    streaming_url_sent = False
+
+    def _on_status(status: str, run_data: dict):
+        nonlocal streaming_url_sent
+        surl = run_data.get("streaming_url")
+        if event_queue and surl and not streaming_url_sent:
+            streaming_url_sent = True
+            logger.info("[%s] Forwarding streaming_url: %s", step_label, surl[:60])
+            event_queue.put_nowait({
+                "event": "agent_streaming",
+                "data": {"step": step_label, "streaming_url": surl},
+            })
+        # Push status on first RUNNING only
+        if event_queue and status == "RUNNING" and not streaming_url_sent:
+            event_queue.put_nowait({
+                "event": "agent_progress",
+                "data": {"step": step_label, "message": f"Agent starting on {url}..."},
+            })
+
+    return await tinyfish_poll_run(run_id, timeout=timeout, on_status=_on_status)
 
 
 async def tinyfish_extract_batch(
@@ -218,45 +247,63 @@ async def tinyfish_extract_batch(
 
     # Phase 1: Fire all runs via batch API
     run_ids = await tinyfish_start_batch(tasks)
+    logger.info("TinyFish batch: fired %d runs, got IDs: %s",
+                len(tasks), [rid[:12] + "..." if rid else "NONE" for rid in run_ids])
 
-    # Phase 2: Poll all pending runs
+    # Phase 2: Poll all pending runs CONCURRENTLY (not sequentially)
     results: list[TinyFishResult] = [TinyFishResult(run_id=rid or None) for rid in run_ids]
     pending = {i: rid for i, rid in enumerate(run_ids) if rid}
     deadline = asyncio.get_event_loop().time() + timeout
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+    ) as client:
         while pending and asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(poll_interval)
-            for i, rid in list(pending.items()):
+
+            # Poll ALL pending runs concurrently in one batch
+            async def _poll_one(i: int, rid: str) -> tuple[int, str | None, dict | None]:
                 try:
                     resp = await client.get(
                         f"{TINYFISH_RUN_URL}/{rid}",
                         headers={"X-API-Key": api_key},
                     )
-                    if resp.status_code != 200:
-                        continue
-                    run_data = resp.json()
-                    status = run_data.get("status", "")
-
-                    # Capture streaming_url
-                    surl = run_data.get("streaming_url")
-                    if surl and not results[i].streaming_url:
-                        results[i].streaming_url = surl
-
-                    if on_progress:
-                        on_progress(i, status, run_data)
-
-                    if status == "COMPLETED":
-                        results[i].data = run_data.get("result")
-                        results[i].success = results[i].data is not None
-                        del pending[i]
-                    elif status in ("FAILED", "CANCELLED"):
-                        del pending[i]
+                    if resp.status_code == 200:
+                        return (i, rid, resp.json())
                 except Exception as e:
-                    logger.warning("TinyFish poll error for %s: %s", rid, e)
+                    logger.debug("TinyFish poll error for %s: %s", rid[:12], e)
+                return (i, rid, None)
+
+            poll_results = await asyncio.gather(
+                *[_poll_one(i, rid) for i, rid in pending.items()]
+            )
+
+            for i, rid, run_data in poll_results:
+                if run_data is None:
+                    continue
+                status = run_data.get("status", "")
+
+                # Capture streaming_url
+                surl = run_data.get("streaming_url")
+                if surl and not results[i].streaming_url:
+                    results[i].streaming_url = surl
+
+                if on_progress:
+                    on_progress(i, status, run_data)
+
+                if status == "COMPLETED":
+                    results[i].data = run_data.get("result")
+                    results[i].success = results[i].data is not None
+                    pending.pop(i, None)
+                    logger.info("TinyFish run %s completed", rid[:12])
+                elif status in ("FAILED", "CANCELLED"):
+                    pending.pop(i, None)
+                    logger.warning("TinyFish run %s: %s", rid[:12], status)
 
     if pending:
         logger.warning("TinyFish batch: %d/%d runs still pending after %ss",
                        len(pending), len(tasks), timeout)
 
+    logger.info("TinyFish batch complete: %d/%d succeeded",
+                sum(1 for r in results if r.success), len(tasks))
     return results
