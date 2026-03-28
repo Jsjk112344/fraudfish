@@ -64,8 +64,8 @@ async def search_platform_for_seller(
         url=platform_url,
         goal=goal,
         stealth=stealth,
-        proxy_country="SG",
-        timeout=15.0,
+        proxy_country="US",
+        timeout=45.0,
     )
     return _normalize_listings(result)
 

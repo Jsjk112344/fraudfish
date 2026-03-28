@@ -33,8 +33,8 @@ async def scan_carousell_market(event_name: str, category: str) -> list[dict]:
         url=search_url,
         goal=goal,
         stealth=True,
-        proxy_country="SG",
-        timeout=15.0,
+        proxy_country="US",
+        timeout=45.0,
     )
     return _normalize_listings(result)
 
@@ -49,8 +49,8 @@ async def scan_viagogo_market(event_name: str) -> list[dict]:
         url="https://www.viagogo.com/",
         goal=goal,
         stealth=True,
-        proxy_country="SG",
-        timeout=15.0,
+        proxy_country="US",
+        timeout=45.0,
     )
     return _normalize_listings(result)
 

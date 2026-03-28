@@ -72,7 +72,7 @@ async def investigate_carousell_seller(seller_username: str, timeout: float = 15
         url=profile_url,
         goal=SELLER_PROFILE_GOAL,
         stealth=True,
-        proxy_country="SG",
+        proxy_country="US",
         timeout=timeout,
     )
     if result is not None:

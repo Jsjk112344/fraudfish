@@ -50,7 +50,7 @@ async def extract_carousell_listing(url: str, timeout: float = 15.0) -> tuple[di
         url=url,
         goal=CAROUSELL_LISTING_GOAL,
         stealth=True,
-        proxy_country="SG",
+        proxy_country="US",
         timeout=timeout,
     )
     if result is not None:
