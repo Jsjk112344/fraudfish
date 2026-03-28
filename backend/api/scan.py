@@ -25,7 +25,6 @@ async def scan_event(request: Request, body: ScanRequest):
                     "data": json.dumps(event["data"]),
                 }
         finally:
-            # Ensure the pipeline generator is closed so it can cancel its tasks
             await pipeline.aclose()
 
     return EventSourceResponse(event_generator())
