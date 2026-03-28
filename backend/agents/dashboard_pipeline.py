@@ -5,10 +5,10 @@ import logging
 import time
 from typing import AsyncGenerator
 
-from agents.event_discovery import discover_events, discover_events_with_streaming, SISTIC_DISCOVERY_GOAL, TICKETMASTER_SG_DISCOVERY_GOAL, _normalize_events, SEED_EVENTS
+from agents.event_discovery import SISTIC_DISCOVERY_GOAL, TICKETMASTER_SG_DISCOVERY_GOAL, _normalize_events, SEED_EVENTS
 from agents.risk_scoring import rank_events
 from agents.market_scan import scan_carousell_market, scan_viagogo_market
-from agents.base import tinyfish_extract_batch
+from agents.base import tinyfish_extract_batch, tinyfish_extract_rich
 from classify import classify
 from models.events import ScanStats
 
@@ -38,32 +38,72 @@ async def run_dashboard_discovery() -> AsyncGenerator[dict, None]:
     }}
 
     yield {"event": "discovery_progress", "data": {
-        "message": "Launching TinyFish agents to scan SISTIC and Ticketmaster SG in parallel...",
+        "message": "Launching TinyFish agents to scan SISTIC and Ticketmaster SG...",
     }}
 
-    # Fire SISTIC + Ticketmaster in true parallel via async batch API
-    # Both agents run simultaneously on TinyFish infra — no sequential blocking
-    events: list[dict] = []
-    is_live = False
+    # Run both SSE extractions concurrently with live progress forwarding
+    # Using asyncio.Queue to collect events from both agents
+    event_queue: asyncio.Queue[dict] = asyncio.Queue()
+    sistic_result = {"data": None}
+    ticketmaster_result = {"data": None}
 
-    def _on_batch_progress(task_idx: int, status: str, run_data: dict):
-        """Log polling progress (can't yield from callback, but logs are visible)."""
-        source = "SISTIC" if task_idx == 0 else "Ticketmaster SG"
-        steps = run_data.get("num_of_steps")
-        logger.info("Discovery poll: %s status=%s steps=%s", source, status, steps)
+    async def _run_sistic():
+        def on_stream(url):
+            event_queue.put_nowait({"event": "agent_streaming", "data": {"step": "discover_sistic", "streaming_url": url}})
+        def on_progress(msg):
+            event_queue.put_nowait({"event": "agent_progress", "data": {"step": "discover_sistic", "message": msg}})
 
-    results = await tinyfish_extract_batch(
-        [
-            {"url": "https://www.sistic.com.sg", "goal": SISTIC_DISCOVERY_GOAL},
-            {"url": "https://www.ticketmaster.sg", "goal": TICKETMASTER_SG_DISCOVERY_GOAL},
-        ],
-        timeout=300.0,
-        poll_interval=5.0,
-        on_progress=_on_batch_progress,
-    )
+        r = await tinyfish_extract_rich(
+            url="https://www.sistic.com.sg",
+            goal=SISTIC_DISCOVERY_GOAL,
+            on_streaming_url=on_stream,
+            on_progress=on_progress,
+        )
+        sistic_result["data"] = r.data
+        event_queue.put_nowait({"event": "agent_progress", "data": {
+            "step": "discover_sistic",
+            "message": f"SISTIC complete — {'got data' if r.data else 'no data'}",
+        }})
 
-    sistic_events = _normalize_events(results[0], "SISTIC") if results[0] else []
-    ticketmaster_events = _normalize_events(results[1], "Ticketmaster SG") if results[1] else []
+    async def _run_ticketmaster():
+        def on_stream(url):
+            event_queue.put_nowait({"event": "agent_streaming", "data": {"step": "discover_ticketmaster", "streaming_url": url}})
+        def on_progress(msg):
+            event_queue.put_nowait({"event": "agent_progress", "data": {"step": "discover_ticketmaster", "message": msg}})
+
+        r = await tinyfish_extract_rich(
+            url="https://www.ticketmaster.sg",
+            goal=TICKETMASTER_SG_DISCOVERY_GOAL,
+            on_streaming_url=on_stream,
+            on_progress=on_progress,
+        )
+        ticketmaster_result["data"] = r.data
+        event_queue.put_nowait({"event": "agent_progress", "data": {
+            "step": "discover_ticketmaster",
+            "message": f"Ticketmaster complete — {'got data' if r.data else 'no data'}",
+        }})
+
+    # Fire both concurrently
+    sistic_task = asyncio.create_task(_run_sistic())
+    ticketmaster_task = asyncio.create_task(_run_ticketmaster())
+
+    # Drain events from both agents as they arrive, yielding to SSE
+    while not (sistic_task.done() and ticketmaster_task.done()):
+        try:
+            ev = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+            yield ev
+        except asyncio.TimeoutError:
+            continue
+
+    # Drain any remaining events
+    while not event_queue.empty():
+        yield event_queue.get_nowait()
+
+    # Await tasks to catch any exceptions
+    await asyncio.gather(sistic_task, ticketmaster_task, return_exceptions=True)
+
+    sistic_events = _normalize_events(sistic_result["data"], "SISTIC")
+    ticketmaster_events = _normalize_events(ticketmaster_result["data"], "Ticketmaster SG")
 
     yield {"event": "discovery_progress", "data": {
         "message": f"SISTIC: {len(sistic_events)} events, Ticketmaster: {len(ticketmaster_events)} events. Ranking by risk...",

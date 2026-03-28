@@ -11,12 +11,14 @@ export async function startEventScan(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ event_name: eventName }),
     signal,
+    openWhenHidden: true,
     onmessage(ev) {
+      if (!ev.data || !ev.data.trim()) return;
       try {
         const data = JSON.parse(ev.data) as Record<string, unknown>;
         onEvent({ event: ev.event, data });
       } catch {
-        onError(new Error('Failed to parse scan SSE event'));
+        // Non-JSON events (pings, comments) are normal — skip silently
       }
     },
     onerror(err) {

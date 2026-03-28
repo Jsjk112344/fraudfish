@@ -22,6 +22,7 @@ TINYFISH_BASE = "https://agent.tinyfish.ai"
 TINYFISH_SSE_URL = f"{TINYFISH_BASE}/v1/automation/run-sse"
 TINYFISH_ASYNC_URL = f"{TINYFISH_BASE}/v1/automation/run-async"
 TINYFISH_RUN_URL = f"{TINYFISH_BASE}/v1/runs"
+TINYFISH_CANCEL_URL = f"{TINYFISH_BASE}/v1/automation/cancel"
 
 # Default poll settings — generous to avoid false timeouts
 DEFAULT_POLL_INTERVAL = 5.0   # seconds between polls
