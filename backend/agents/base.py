@@ -3,29 +3,31 @@
 Uses the async API to fire runs, then polls for status/results. This avoids
 the false timeout problem where our code gives up but the TinyFish agent is
 still running fine on their servers.
+
+Polling also captures streaming_url from the run object — no need for the
+thread-unsafe SSE path to get live browser previews.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, Callable
+from typing import Callable
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
 TINYFISH_BASE = "https://agent.tinyfish.ai"
-TINYFISH_SSE_URL = f"{TINYFISH_BASE}/v1/automation/run-sse"
 TINYFISH_ASYNC_URL = f"{TINYFISH_BASE}/v1/automation/run-async"
+TINYFISH_BATCH_URL = f"{TINYFISH_BASE}/v1/automation/run-batch"
 TINYFISH_RUN_URL = f"{TINYFISH_BASE}/v1/runs"
 TINYFISH_CANCEL_URL = f"{TINYFISH_BASE}/v1/automation/cancel"
 
 # Default poll settings — generous to avoid false timeouts
-DEFAULT_POLL_INTERVAL = 5.0   # seconds between polls
+DEFAULT_POLL_INTERVAL = 4.0   # seconds between polls
 DEFAULT_TIMEOUT = 300.0        # 5 minutes — agents take time on Cloudflare sites
 
 
@@ -85,6 +87,34 @@ async def tinyfish_start_run(
     return None
 
 
+async def tinyfish_start_batch(
+    tasks: list[dict],
+) -> list[str]:
+    """Fire multiple TinyFish runs via the batch endpoint. Returns run_ids."""
+    api_key = _get_api_key()
+    runs = [_build_body(t["url"], t["goal"], t.get("stealth", False), t.get("proxy_country")) for t in tasks]
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                TINYFISH_BATCH_URL,
+                headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+                json={"runs": runs},
+            )
+            if resp.status_code == 200:
+                return resp.json().get("run_ids", [])
+            else:
+                logger.warning("TinyFish batch start failed (%s): %s",
+                               resp.status_code, resp.text[:200])
+    except Exception as e:
+        logger.warning("TinyFish batch start error: %s", e)
+    # Fallback: fire individually
+    ids = []
+    for t in tasks:
+        rid = await tinyfish_start_run(t["url"], t["goal"], t.get("stealth", False), t.get("proxy_country"))
+        ids.append(rid or "")
+    return ids
+
+
 async def tinyfish_poll_run(
     run_id: str,
     timeout: float = DEFAULT_TIMEOUT,
@@ -93,9 +123,10 @@ async def tinyfish_poll_run(
 ) -> TinyFishResult:
     """Poll a TinyFish run until completion.
 
+    Captures streaming_url from the run object for live browser preview.
+
     Args:
         on_status: Optional callback(status, run_data) called each poll cycle.
-                   Useful for forwarding progress to frontend.
     """
     api_key = _get_api_key()
     result = TinyFishResult(run_id=run_id)
@@ -114,6 +145,11 @@ async def tinyfish_poll_run(
 
                 run_data = resp.json()
                 status = run_data.get("status", "")
+
+                # Capture streaming_url as soon as it appears
+                surl = run_data.get("streaming_url")
+                if surl and not result.streaming_url:
+                    result.streaming_url = surl
 
                 if on_status:
                     on_status(status, run_data)
@@ -148,33 +184,44 @@ async def tinyfish_extract(
     return result.data
 
 
+async def tinyfish_extract_with_streaming(
+    url: str,
+    goal: str,
+    stealth: bool = False,
+    proxy_country: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+) -> TinyFishResult:
+    """Extraction that also captures the streaming_url for live preview.
+
+    Uses async+poll (thread-safe) — streaming_url is available on the
+    run object via GET /v1/runs/{id}, no SSE needed.
+    """
+    run_id = await tinyfish_start_run(url, goal, stealth, proxy_country)
+    if not run_id:
+        return TinyFishResult()
+    return await tinyfish_poll_run(run_id, timeout=timeout)
+
+
 async def tinyfish_extract_batch(
     tasks: list[dict],
     timeout: float = DEFAULT_TIMEOUT,
     poll_interval: float = DEFAULT_POLL_INTERVAL,
     on_progress: Callable[[int, str, dict], None] | None = None,
-) -> list[dict | None]:
+) -> list[TinyFishResult]:
     """Fire multiple extractions in parallel, poll all until complete.
 
     Each task: {url, goal, stealth?, proxy_country?}
     on_progress: callback(task_index, status, run_data) per poll cycle.
-    Returns results in same order as tasks.
+    Returns TinyFishResult list (with streaming_url) in same order as tasks.
     """
     api_key = _get_api_key()
 
-    # Phase 1: Fire all runs
-    run_ids: list[str | None] = []
-    for task in tasks:
-        rid = await tinyfish_start_run(
-            task["url"], task["goal"],
-            task.get("stealth", False),
-            task.get("proxy_country"),
-        )
-        run_ids.append(rid)
+    # Phase 1: Fire all runs via batch API
+    run_ids = await tinyfish_start_batch(tasks)
 
     # Phase 2: Poll all pending runs
-    results: list[dict | None] = [None] * len(tasks)
-    pending = {i: rid for i, rid in enumerate(run_ids) if rid is not None}
+    results: list[TinyFishResult] = [TinyFishResult(run_id=rid or None) for rid in run_ids]
+    pending = {i: rid for i, rid in enumerate(run_ids) if rid}
     deadline = asyncio.get_event_loop().time() + timeout
 
     async with httpx.AsyncClient(timeout=15.0) as client:
@@ -191,11 +238,17 @@ async def tinyfish_extract_batch(
                     run_data = resp.json()
                     status = run_data.get("status", "")
 
+                    # Capture streaming_url
+                    surl = run_data.get("streaming_url")
+                    if surl and not results[i].streaming_url:
+                        results[i].streaming_url = surl
+
                     if on_progress:
                         on_progress(i, status, run_data)
 
                     if status == "COMPLETED":
-                        results[i] = run_data.get("result")
+                        results[i].data = run_data.get("result")
+                        results[i].success = results[i].data is not None
                         del pending[i]
                     elif status in ("FAILED", "CANCELLED"):
                         del pending[i]
@@ -207,95 +260,3 @@ async def tinyfish_extract_batch(
                        len(pending), len(tasks), timeout)
 
     return results
-
-
-# ---------------------------------------------------------------------------
-# SSE streaming API (for live browser preview + progress narration)
-# ---------------------------------------------------------------------------
-
-def _sync_extract_sse(
-    url: str,
-    goal: str,
-    stealth: bool = False,
-    proxy_country: str | None = None,
-    on_streaming_url: Callable[[str], None] | None = None,
-    on_progress: Callable[[str], None] | None = None,
-) -> TinyFishResult:
-    """Direct REST SSE extraction for live browser preview.
-
-    Only use this when you need the streaming_url for the live preview iframe.
-    For simple data extraction, use tinyfish_extract() (async + poll) instead.
-    """
-    body = _build_body(url, goal, stealth, proxy_country)
-    result = TinyFishResult()
-
-    try:
-        with httpx.stream(
-            "POST",
-            TINYFISH_SSE_URL,
-            headers={"X-API-Key": _get_api_key(), "Content-Type": "application/json"},
-            json=body,
-            timeout=httpx.Timeout(connect=15.0, read=600.0, write=15.0, pool=15.0),
-        ) as resp:
-            if resp.status_code != 200:
-                logger.warning("TinyFish SSE returned %s for %s", resp.status_code, url)
-                return result
-
-            buffer = ""
-            for chunk in resp.iter_text():
-                buffer += chunk
-                while "\n\n" in buffer:
-                    event_block, buffer = buffer.split("\n\n", 1)
-                    for line in event_block.strip().split("\n"):
-                        if not line.startswith("data:"):
-                            continue
-                        try:
-                            data = json.loads(line[5:].strip())
-                        except json.JSONDecodeError:
-                            continue
-
-                        etype = data.get("type", "")
-
-                        if etype == "STREAMING_URL":
-                            surl = data.get("streaming_url")
-                            if surl:
-                                result.streaming_url = surl
-                                if on_streaming_url:
-                                    on_streaming_url(surl)
-
-                        elif etype == "PROGRESS":
-                            msg = data.get("purpose", "")
-                            if msg:
-                                result.progress_messages.append(msg)
-                                if on_progress:
-                                    on_progress(msg)
-
-                        elif etype == "COMPLETE":
-                            if data.get("status") == "COMPLETED":
-                                result.data = data.get("result")
-                                result.success = result.data is not None
-                            return result
-
-    except Exception as e:
-        logger.warning("TinyFish SSE failed for %s: %s", url, e)
-
-    return result
-
-
-async def tinyfish_extract_rich(
-    url: str,
-    goal: str,
-    stealth: bool = False,
-    proxy_country: str | None = None,
-    on_streaming_url: Callable[[str], None] | None = None,
-    on_progress: Callable[[str], None] | None = None,
-) -> TinyFishResult:
-    """SSE extraction with streaming URL and progress callbacks.
-
-    No artificial timeout — waits for TinyFish to finish naturally.
-    The SSE read timeout is 10 minutes (httpx.Timeout read=600s).
-    """
-    return await asyncio.to_thread(
-        _sync_extract_sse, url, goal, stealth, proxy_country,
-        on_streaming_url, on_progress,
-    )

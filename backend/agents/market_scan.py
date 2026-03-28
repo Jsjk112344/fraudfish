@@ -108,11 +108,11 @@ async def scan_markets_batch(event_name: str, category: str = "tickets") -> tupl
             {"url": "https://www.viagogo.com/", "goal": viagogo_goal},
         ],
         timeout=120.0,
-        poll_interval=5.0,
+        poll_interval=4.0,
     )
 
-    carousell = _normalize_listings(results[0]) if results[0] else []
-    viagogo = _normalize_listings(results[1]) if results[1] else []
+    carousell = _normalize_listings(results[0].data) if results[0].data else []
+    viagogo = _normalize_listings(results[1].data) if results[1].data else []
     return carousell, viagogo
 
 

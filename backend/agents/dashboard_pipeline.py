@@ -1,14 +1,19 @@
-"""Dashboard pipeline: discover events -> rank by risk -> scan top threats."""
+"""Dashboard pipeline: discover events -> rank by risk -> scan top threats.
+
+Uses two-phase parallel discovery:
+  Phase 1: Quick agents find event links on SISTIC + Ticketmaster
+  Phase 2: Batch API fires parallel agents to extract details per event
+"""
 
 import asyncio
 import logging
 import time
 from typing import AsyncGenerator
 
-from agents.event_discovery import SISTIC_DISCOVERY_GOAL, TICKETMASTER_SG_DISCOVERY_GOAL, _normalize_events, SEED_EVENTS
+from agents.event_discovery import discover_events_parallel, SEED_EVENTS
 from agents.risk_scoring import rank_events
 from agents.market_scan import scan_carousell_market, scan_viagogo_market
-from agents.base import tinyfish_extract_batch, tinyfish_extract_rich
+from agents.base import tinyfish_extract_batch, TinyFishResult
 from classify import classify
 from models.events import ScanStats
 
@@ -23,11 +28,14 @@ CONCURRENCY = 3             # TinyFish session limit
 async def run_dashboard_discovery() -> AsyncGenerator[dict, None]:
     """Phase 1: Discover events and rank by risk.
 
+    Uses two-phase parallel discovery — fast link scan, then batch detail extraction.
+    Streaming URLs are captured from polling (thread-safe, no SSE needed).
+
     SSE events yielded:
     - discovery_started: {sources}
     - discovery_progress: {message}
-    - agent_streaming: {step, streaming_url}  — live browser preview from TinyFish
-    - agent_progress: {step, message}          — agent narration from TinyFish
+    - agent_streaming: {step, streaming_url}  -- live browser preview from TinyFish
+    - agent_progress: {step, message}          -- agent narration
     - events_discovered: {events, total_count, is_live}
     - discovery_complete: {duration_seconds}
     """
@@ -38,97 +46,42 @@ async def run_dashboard_discovery() -> AsyncGenerator[dict, None]:
     }}
 
     yield {"event": "discovery_progress", "data": {
-        "message": "Launching TinyFish agents to scan SISTIC and Ticketmaster SG...",
+        "message": "Launching parallel agents to scan SISTIC and Ticketmaster SG...",
     }}
 
-    # Run both SSE extractions concurrently with live progress forwarding
-    # Using asyncio.Queue to collect events from both agents
-    event_queue: asyncio.Queue[dict] = asyncio.Queue()
-    sistic_result = {"data": None}
-    ticketmaster_result = {"data": None}
+    # Forward all events from the two-phase discovery pipeline
+    events: list[dict] = []
+    is_live = False
 
-    async def _run_sistic():
-        def on_stream(url):
-            event_queue.put_nowait({"event": "agent_streaming", "data": {"step": "discover_sistic", "streaming_url": url}})
-        def on_progress(msg):
-            event_queue.put_nowait({"event": "agent_progress", "data": {"step": "discover_sistic", "message": msg}})
+    async for ev in discover_events_parallel():
+        etype = ev["event"]
 
-        r = await tinyfish_extract_rich(
-            url="https://www.sistic.com.sg",
-            goal=SISTIC_DISCOVERY_GOAL,
-            on_streaming_url=on_stream,
-            on_progress=on_progress,
-        )
-        sistic_result["data"] = r.data
-        event_queue.put_nowait({"event": "agent_progress", "data": {
-            "step": "discover_sistic",
-            "message": f"SISTIC complete — {'got data' if r.data else 'no data'}",
-        }})
-
-    async def _run_ticketmaster():
-        def on_stream(url):
-            event_queue.put_nowait({"event": "agent_streaming", "data": {"step": "discover_ticketmaster", "streaming_url": url}})
-        def on_progress(msg):
-            event_queue.put_nowait({"event": "agent_progress", "data": {"step": "discover_ticketmaster", "message": msg}})
-
-        r = await tinyfish_extract_rich(
-            url="https://www.ticketmaster.sg",
-            goal=TICKETMASTER_SG_DISCOVERY_GOAL,
-            on_streaming_url=on_stream,
-            on_progress=on_progress,
-        )
-        ticketmaster_result["data"] = r.data
-        event_queue.put_nowait({"event": "agent_progress", "data": {
-            "step": "discover_ticketmaster",
-            "message": f"Ticketmaster complete — {'got data' if r.data else 'no data'}",
-        }})
-
-    # Fire both concurrently
-    sistic_task = asyncio.create_task(_run_sistic())
-    ticketmaster_task = asyncio.create_task(_run_ticketmaster())
-
-    # Drain events from both agents as they arrive, yielding to SSE
-    while not (sistic_task.done() and ticketmaster_task.done()):
-        try:
-            ev = await asyncio.wait_for(event_queue.get(), timeout=1.0)
+        # Forward streaming and progress events directly to frontend
+        if etype in ("agent_streaming", "agent_progress"):
             yield ev
-        except asyncio.TimeoutError:
-            continue
+            # Also emit as discovery_progress for the narration log
+            if etype == "agent_progress":
+                yield {"event": "discovery_progress", "data": {
+                    "message": ev["data"].get("message", ""),
+                }}
 
-    # Drain any remaining events
-    while not event_queue.empty():
-        yield event_queue.get_nowait()
+        elif etype == "phase1_complete":
+            sistic_n = ev["data"]["sistic_count"]
+            tm_n = ev["data"]["ticketmaster_count"]
+            yield {"event": "discovery_progress", "data": {
+                "message": f"Found {sistic_n} SISTIC + {tm_n} Ticketmaster event links. Extracting details...",
+            }}
 
-    # Await tasks to catch any exceptions
-    await asyncio.gather(sistic_task, ticketmaster_task, return_exceptions=True)
+        elif etype == "phase2_started":
+            yield {"event": "discovery_progress", "data": {
+                "message": f"Firing {ev['data']['total_events']} parallel agents for detail extraction...",
+            }}
 
-    sistic_events = _normalize_events(sistic_result["data"], "SISTIC")
-    ticketmaster_events = _normalize_events(ticketmaster_result["data"], "Ticketmaster SG")
+        elif etype == "discovery_result":
+            events = ev["data"]["events"]
+            is_live = ev["data"]["is_live"]
 
-    yield {"event": "discovery_progress", "data": {
-        "message": f"SISTIC: {len(sistic_events)} events, Ticketmaster: {len(ticketmaster_events)} events. Ranking by risk...",
-    }}
-
-    # Merge and deduplicate
-    seen: set[str] = set()
-    merged: list[dict] = []
-    for ev in sistic_events + ticketmaster_events:
-        name_key = ev.get("event_name", "").strip().lower()
-        if name_key and name_key not in seen:
-            seen.add(name_key)
-            merged.append(ev)
-
-    is_live = len(merged) >= 3
-    if not is_live:
-        logger.info("Only %d live events found, supplementing with seed data", len(merged))
-        for ev in SEED_EVENTS:
-            name_key = ev["event_name"].strip().lower()
-            if name_key not in seen:
-                seen.add(name_key)
-                merged.append(ev)
-
-    events = merged
-
+    # Rank by risk
     ranked = rank_events(events)
 
     yield {"event": "events_discovered", "data": {
@@ -194,7 +147,7 @@ async def run_dashboard_scan(events: list[dict]) -> AsyncGenerator[dict, None]:
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    async def scan_one_event(ev: dict) -> list[dict]:
+    async def scan_one_event(ev: dict) -> tuple[list[dict], ScanStats]:
         """Scan a single event — discover listings then classify."""
         event_id = ev["event_id"]
         event_name = ev["event_name"]

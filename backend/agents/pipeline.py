@@ -9,6 +9,9 @@ from agents.telegram import extract_telegram_message
 from agents.seller import investigate_carousell_seller
 from agents.seller_telegram import investigate_telegram_seller
 from agents.official_price import verify_event_official
+from agents.market_scan import check_market_with_fallback
+from agents.cross_platform import cross_platform_with_fallback
+from classify import classify
 from models.events import InvestigationEvent
 from models.enums import StepStatus
 
@@ -94,4 +97,87 @@ async def _run_pipeline(url: str, platform: str) -> AsyncGenerator[Investigation
         step="verify_event",
         status=StepStatus.COMPLETE,
         data={**event_data, "_live": event_live},
+    )
+
+    # Steps 4 & 5: Market rate check + cross-platform search in parallel
+    yield InvestigationEvent(step="check_market", status=StepStatus.ACTIVE, data=None)
+    yield InvestigationEvent(step="cross_platform", status=StepStatus.ACTIVE, data=None)
+
+    xplat_input = {
+        "title": listing_data.get("title", ""),
+        "seller_name": seller_username,
+        "platform": platform.capitalize(),
+    }
+
+    market_result, xplat_result = await asyncio.gather(
+        check_market_with_fallback(listing_data),
+        cross_platform_with_fallback(xplat_input),
+    )
+
+    market_data, market_live = market_result
+    xplat_data, xplat_live = xplat_result
+
+    yield InvestigationEvent(
+        step="check_market",
+        status=StepStatus.COMPLETE,
+        data={**market_data, "_live": market_live},
+    )
+    yield InvestigationEvent(
+        step="cross_platform",
+        status=StepStatus.COMPLETE,
+        data={**xplat_data, "_live": xplat_live},
+    )
+
+    # Step 6: Synthesize verdict from all evidence
+    yield InvestigationEvent(step="synthesize", status=StepStatus.ACTIVE, data=None)
+
+    try:
+        price_raw = listing_data.get("price", 0)
+        price = float(price_raw) if price_raw else 0.0
+    except (TypeError, ValueError):
+        price = 0.0
+
+    try:
+        face_raw = event_data.get("face_value_low") or event_data.get("face_value") or 0
+        face_value = float(face_raw) if face_raw else 0.0
+    except (TypeError, ValueError):
+        face_value = 0.0
+
+    evidence = {
+        "listing": {
+            "title": listing_data.get("title", ""),
+            "price": price,
+            "seller_username": seller_username,
+            "platform": platform,
+            "description": listing_data.get("description", ""),
+        },
+        "event": {
+            "name": event_data.get("event_name") or event_data.get("name", ""),
+            "face_value": face_value,
+            "sold_out": event_data.get("sold_out", False),
+        },
+        "seller": {
+            "account_age": seller_data.get("account_age"),
+            "total_listings": seller_data.get("total_listings"),
+            "overall_rating": seller_data.get("overall_rating"),
+            "review_sentiment": seller_data.get("review_sentiment"),
+        },
+        "market": market_data,
+        "cross_platform": xplat_data,
+    }
+
+    verdict = await classify(evidence)
+    verdict_dump = verdict.model_dump()
+
+    yield InvestigationEvent(
+        step="synthesize",
+        status=StepStatus.COMPLETE,
+        data={"signals": verdict_dump.get("signals", []), "reasoning": verdict_dump.get("reasoning", "")},
+    )
+
+    # Final verdict event
+    yield InvestigationEvent(
+        step="verdict",
+        status=StepStatus.COMPLETE,
+        data=verdict_dump,
     )
