@@ -1,0 +1,70 @@
+{
+  "listing": {
+    "title": "F1 Singapore Grand Prix 2026 - Pit Grandstand",
+    "price": 150.00,
+    "currency": "SGD",
+    "description": "Selling 2x F1 Singapore GP tickets. Pit Grandstand. Can only do PayNow transfer, meet-up not possible.",
+    "seller_name": "fasttickets_sg",
+    "transfer_method": "PayNow only",
+    "posted_date": "2026-03-20",
+    "platform": "Carousell",
+    "url": "https://www.carousell.sg/p/f1-singapore-gp-2026-pit-grandstand-1234567890"
+  },
+  "seller": {
+    "username": "fasttickets_sg",
+    "account_age_days": 12,
+    "total_listings": 47,
+    "active_listings": 23,
+    "categories": ["Tickets & Vouchers", "Electronics"],
+    "reviews_count": 2,
+    "reviews_sentiment": "mixed",
+    "review_texts": ["Fast reply but item never arrived", "Decent seller"],
+    "verified": false
+  },
+  "event": {
+    "name": "Formula 1 Singapore Airlines Singapore Grand Prix 2026",
+    "date": "2026-10-03",
+    "venue": "Marina Bay Street Circuit",
+    "official_source": "Singapore GP Official",
+    "face_value": 698.00,
+    "currency": "SGD",
+    "sold_out": false,
+    "category_match": "Pit Grandstand"
+  },
+  "market": {
+    "listings_scanned": 24,
+    "platform_breakdown": { "Carousell": 15, "Viagogo": 9 },
+    "average_price": 580.00,
+    "median_price": 550.00,
+    "min_price": 320.00,
+    "max_price": 950.00,
+    "this_listing_percentile": 3,
+    "price_deviation_percent": -74.1,
+    "is_outlier": true,
+    "outlier_direction": "suspiciously_low"
+  },
+  "cross_platform": {
+    "duplicates_found": true,
+    "matches": [
+      {
+        "platform": "Facebook Marketplace",
+        "seller_name": "Fast Tickets SG",
+        "listing_title": "F1 SG GP 2026 Pit Grandstand - CHEAP!!",
+        "price": 160.00,
+        "similarity_score": 0.92
+      }
+    ]
+  },
+  "verdict": {
+    "category": "LIKELY_SCAM",
+    "confidence": 94.2,
+    "reasoning": "EVIDENCE ANALYSIS:\n\n1. PRICING ANOMALY (CRITICAL): Listed at S$150 — 78.5% below the official face value of S$698 and 74.1% below the market average of S$580. This is in the bottom 3rd percentile of 24 scanned listings. Extreme underpricing is the strongest individual scam indicator.\n\n2. SELLER PROFILE (CRITICAL): Account is only 12 days old with 47 listings across unrelated categories (Tickets + Electronics). Only 2 reviews, one reporting non-delivery. This pattern matches known scam account behavior — new accounts flooding multiple categories.\n\n3. EVENT VERIFICATION (CLEAR): The F1 Singapore Grand Prix 2026 is a verified real event at Marina Bay Street Circuit. Pit Grandstand tickets exist at S$698 face value. Event is NOT sold out, meaning legitimate resale at this discount is highly unlikely.\n\n4. CROSS-PLATFORM DUPLICATES (WARNING): Same seller appears on Facebook Marketplace under slightly different name ('Fast Tickets SG' vs 'fasttickets_sg') with nearly identical listing (92% text similarity). Cross-platform posting with name variations is a common scam pattern.\n\n5. LISTING AUTHENTICITY (WARNING): PayNow-only payment with no meet-up option removes all buyer protection. Legitimate sellers typically offer platform-mediated payment or in-person exchange.\n\nCONCLUSION: Multiple converging signals — extreme underpricing, brand-new account, cross-platform duplicates, and payment red flags — produce high confidence that this is a fraudulent listing.",
+    "signals": [
+      { "name": "Pricing Anomaly", "severity": "CRITICAL", "segmentsFilled": 5 },
+      { "name": "Seller Reputation", "severity": "CRITICAL", "segmentsFilled": 5 },
+      { "name": "Event Verification", "severity": "CLEAR", "segmentsFilled": 1 },
+      { "name": "Cross-Platform Duplicates", "severity": "WARNING", "segmentsFilled": 3 },
+      { "name": "Listing Authenticity", "severity": "WARNING", "segmentsFilled": 3 }
+    ]
+  }
+}

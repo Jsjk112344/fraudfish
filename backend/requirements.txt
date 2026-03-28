@@ -1,0 +1,11 @@
+fastapi==0.128.8
+uvicorn[standard]
+sse-starlette==3.3.0
+pydantic==2.12.5
+pytest
+pytest-asyncio
+httpx
+tinyfish
+python-dotenv
+openai>=2.20.0
+anthropic>=0.39.0
